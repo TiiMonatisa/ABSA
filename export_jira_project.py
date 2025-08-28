@@ -4,7 +4,7 @@ import sys
 import csv
 import time
 import argparse
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple, List
 from urllib.parse import urljoin
 from datetime import datetime, timezone
 import requests
@@ -63,13 +63,23 @@ def parse_jira_time(s: Optional[str]) -> Optional[datetime]:
 def dt_to_iso(dt: Optional[datetime]) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if dt else ""
 
+def is_http_400(err: Exception) -> bool:
+    return isinstance(err, requests.HTTPError) and getattr(err.response, "status_code", None) == 400
+
+def quote_aaid(account_id: str) -> str:
+    # Some sites require quoting AAIDs when used in JQL user fields (esp. with `was`).
+    return f'"{account_id}"'
+
 class JiraClient:
     def __init__(self, base_url: str, email: str, api_token: str):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
         self.session.auth = HTTPBasicAuth(email, api_token)
         self.session.headers.update({"Accept": "application/json"})
+        # caches
         self._group_members_cache: Dict[str, Set[str]] = {}
+        self._role_map_cache: Dict[str, Dict[str, str]] = {}
+        self._role_members_cache: Dict[Tuple[str, bool], Dict[str, Set[str]]] = {}
 
     def _get(self, path_or_url: str, params: Optional[Dict] = None):
         url = path_or_url if path_or_url.startswith("http") else urljoin(self.base_url + "/", path_or_url.lstrip("/"))
@@ -133,6 +143,82 @@ class JiraClient:
             params["expand"] = ",".join(expand)
         return self._get("/rest/api/3/search", params=params) or {}
 
+    # ----- Roles: map + members (expand groups) -----
+    def get_project_roles_map(self, project_key: str) -> Dict[str, str]:
+        if project_key in self._role_map_cache:
+            return self._role_map_cache[project_key]
+        data = self._get(f"/rest/api/3/project/{project_key}/role") or {}
+        role_map = {name: url for name, url in data.items()}
+        self._role_map_cache[project_key] = role_map
+        return role_map
+
+    def _expand_group_members(self, group_id: Optional[str], group_name: Optional[str], include_inactive: bool) -> Set[str]:
+        cache_key = f"id:{group_id}" if group_id else f"name:{group_name}"
+        if cache_key in self._group_members_cache:
+            return self._group_members_cache[cache_key]
+
+        params = {
+            "startAt": 0,
+            "maxResults": GROUP_PAGE_SIZE,
+            "includeInactiveUsers": str(include_inactive).lower()
+        }
+        if group_id:
+            params["groupId"] = group_id
+        elif group_name:
+            params["groupname"] = group_name
+
+        members: Set[str] = set()
+        try:
+            while True:
+                data = self._get("/rest/api/3/group/member", params=params) or {}
+                vals = data.get("values", []) or []
+                for m in vals:
+                    acc = m.get("accountId")
+                    if acc:
+                        members.add(acc)
+                start_at = data.get("startAt", 0)
+                max_results = data.get("maxResults", GROUP_PAGE_SIZE)
+                total = data.get("total", start_at + len(vals))
+                if start_at + max_results >= total:
+                    break
+                params["startAt"] = start_at + max_results
+        except requests.HTTPError as e:
+            print(f"[WARN] Could not expand group members for {cache_key}: {e}", file=sys.stderr)
+
+        self._group_members_cache[cache_key] = members
+        return members
+
+    def get_project_role_members(self, project_key: str, include_inactive: bool = False) -> Dict[str, Set[str]]:
+        cache_key = (project_key, include_inactive)
+        if cache_key in self._role_members_cache:
+            return self._role_members_cache[cache_key]
+
+        out: Dict[str, Set[str]] = {}
+        role_map = self.get_project_roles_map(project_key)
+        for role_name, role_url in role_map.items():
+            try:
+                role = self._get(role_url) or {}
+            except requests.HTTPError as e:
+                print(f"[WARN] Failed to fetch role '{role_name}' for {project_key}: {e}", file=sys.stderr)
+                continue
+
+            members: Set[str] = set()
+            for actor in role.get("actors", []) or []:
+                atype = actor.get("type")
+                if atype == "atlassian-user-role-actor":
+                    acc = (actor.get("actorUser") or {}).get("accountId")
+                    if acc:
+                        members.add(acc)
+                elif atype == "atlassian-group-role-actor":
+                    grp = actor.get("actorGroup") or {}
+                    gid = grp.get("groupId")
+                    gname = grp.get("name") or actor.get("name")
+                    members |= self._expand_group_members(gid, gname, include_inactive)
+            out[role_name] = members
+
+        self._role_members_cache[cache_key] = out
+        return out
+
 class AtlassianAdminClient:
     """
     Organization Admin API for last-active dates (per product).
@@ -171,7 +257,6 @@ class AtlassianAdminClient:
         try:
             data = self._get(f"/orgs/{self.org_id}/directory/users/{account_id}/last-active-dates") or {}
         except requests.HTTPError as e:
-            # Surface helpful hints and cache None so we don't retry this user again
             status = getattr(e.response, "status_code", None)
             if status == 403:
                 print(
@@ -204,52 +289,63 @@ def get_latest_user_activity_in_project(jc: JiraClient, project_key: str, accoun
     """
     Returns the latest UTC timestamp where the user either created an issue in the project
     or authored an update on an issue they were ever assignee/reporter on.
+    If a 400 occurs in any JQL call, we log a WARN and SKIP this user (return None).
     """
-    # 1) Newest issue CREATED by the user
+    aaid = quote_aaid(account_id)
+
+    # 1) newest issue CREATED by the user
     created_dt = None
     try:
-        # NOTE: use raw accountId, not accountId() function
-        jql_created = f'project = "{project_key}" AND creator = {account_id} ORDER BY created DESC'
+        jql_created = f'project = "{project_key}" AND creator = {aaid} ORDER BY created DESC'
         data_created = jc.search_issues(jql_created, start_at=0, max_results=1, fields=["created"])
         issues_c = data_created.get("issues", [])
         if issues_c:
             created_dt = parse_jira_time(((issues_c[0] or {}).get("fields") or {}).get("created"))
-    except requests.HTTPError:
-        pass
+    except requests.HTTPError as e:
+        if is_http_400(e):
+            print(f"[WARN] 400 on created-scan; skipping user {account_id} in {project_key}", file=sys.stderr)
+            return None
+        raise
 
-    # 2) Latest UPDATE authored by the user on issues they were ever assignee/reporter
+    # 2) latest UPDATE authored by the user on issues they were ever assignee/reporter
     jql_updated = (
         f'project = "{project_key}" '
-        f'AND (assignee was {account_id} OR reporter was {account_id}) '
+        f'AND (assignee was {aaid} OR reporter was {aaid}) '
         f'ORDER BY updated DESC'
     )
+
     scanned = 0
     start_at = 0
     best_dt = None
 
-    while scanned < max_issue_scan:
-        data = jc.search_issues(jql_updated, start_at=start_at, max_results=DEFAULT_PAGE_SIZE,
-                                fields=["updated"], expand=["changelog"])
-        issues = data.get("issues", [])
-        if not issues:
-            break
-        for issue in issues:
-            scanned += 1
-            histories = (((issue or {}).get("changelog") or {}).get("histories")) or []
-            latest_by_user = None
-            for h in histories:
-                author = (h.get("author") or {})
-                if author.get("accountId") == account_id:
-                    dt = parse_jira_time(h.get("created"))
-                    if dt and (latest_by_user is None or dt > latest_by_user):
-                        latest_by_user = dt
-            if latest_by_user and (best_dt is None or latest_by_user > best_dt):
-                best_dt = latest_by_user
-        if len(issues) < DEFAULT_PAGE_SIZE:
-            break
-        start_at += DEFAULT_PAGE_SIZE
+    try:
+        while scanned < max_issue_scan:
+            data = jc.search_issues(jql_updated, start_at=start_at, max_results=DEFAULT_PAGE_SIZE,
+                                    fields=["updated"], expand=["changelog"])
+            issues = data.get("issues", [])
+            if not issues:
+                break
+            for issue in issues:
+                scanned += 1
+                histories = (((issue or {}).get("changelog") or {}).get("histories")) or []
+                latest_by_user = None
+                for h in histories:
+                    if (h.get("author") or {}).get("accountId") == account_id:
+                        dt = parse_jira_time(h.get("created"))
+                        if dt and (latest_by_user is None or dt > latest_by_user):
+                            latest_by_user = dt
+                if latest_by_user and (best_dt is None or latest_by_user > best_dt):
+                    best_dt = latest_by_user
+            if len(issues) < DEFAULT_PAGE_SIZE:
+                break
+            start_at += DEFAULT_PAGE_SIZE
+    except requests.HTTPError as e:
+        if is_http_400(e):
+            print(f"[WARN] 400 on update-scan; skipping user {account_id} in {project_key}", file=sys.stderr)
+            return None
+        raise
 
-    # 3) Pick the later of created_dt vs best_dt
+    # 3) pick later of created vs updated
     if created_dt and (not best_dt or created_dt >= best_dt):
         return created_dt
     return best_dt
@@ -270,9 +366,8 @@ def export_contributors(base_url: str, email: str, token: str, out_csv: str,
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        # Removed: issue key + source
         header = ["project name", "project key", "user name", "email",
-                  "last worked (UTC)", "last active (UTC)"]
+                  "last worked (UTC)", "last active (UTC)", "Roles"]
         writer.writerow(header)
 
         for proj in proj_iter:
@@ -280,6 +375,13 @@ def export_contributors(base_url: str, email: str, token: str, out_csv: str,
             pname = proj.get("name") or pkey
             if not pkey:
                 continue
+
+            # Preload project role membership (expands groups)
+            try:
+                role_members = jc.get_project_role_members(pkey, include_inactive=include_inactive)
+            except requests.HTTPError as e:
+                print(f"[WARN] Failed to load roles for {pkey}: {e}", file=sys.stderr)
+                role_members = {}
 
             users = list(jc.iter_users_with_browse(pkey, include_inactive=include_inactive))
             user_iter = tqdm(users, desc=f"{pkey} users", leave=False, unit="user") if show_progress and tqdm else users
@@ -295,7 +397,6 @@ def export_contributors(base_url: str, email: str, token: str, out_csv: str,
                 if not email_address and try_email_lookup:
                     if acc_id not in email_cache:
                         try:
-                            # Requires site admin approval in many orgs
                             email_cache[acc_id] = jc._get("/rest/api/3/user/email", params={"accountId": acc_id}).get("email")
                         except Exception:
                             email_cache[acc_id] = None
@@ -304,18 +405,22 @@ def export_contributors(base_url: str, email: str, token: str, out_csv: str,
                 last_worked_dt = get_latest_user_activity_in_project(
                     jc, pkey, acc_id, max_issue_scan=max_issue_scan
                 )
+                # if 400 occurred, function returns None; we still write the row
 
                 last_active_dt = admin.get_last_active_any_product(acc_id)
 
+                user_roles = sorted([rname for rname, members in (role_members or {}).items() if acc_id in members])
+                roles_str = "; ".join(user_roles)
+
                 writer.writerow([
                     pname, pkey, display_name, email_address,
-                    dt_to_iso(last_worked_dt), dt_to_iso(last_active_dt)
+                    dt_to_iso(last_worked_dt), dt_to_iso(last_active_dt), roles_str
                 ])
 
 def main():
     load_dotenv(find_dotenv(usecwd=True))
 
-    parser = argparse.ArgumentParser(description="Export Jira Cloud contributors with latest activity + last login (.env supported).")
+    parser = argparse.ArgumentParser(description="Export Jira Cloud contributors with latest activity, last login, and project roles (.env supported).")
     parser.add_argument("--base-url", default=os.environ.get("JIRA_BASE_URL"))
     parser.add_argument("--email", default=os.environ.get("JIRA_EMAIL"))
     parser.add_argument("--api-token", default=os.environ.get("JIRA_API_TOKEN"))
