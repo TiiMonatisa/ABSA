@@ -4,7 +4,7 @@ import sys
 import csv
 import time
 import argparse
-from typing import Dict, Iterable, Optional, Set, Tuple, List
+from typing import Dict, Iterable, Optional, Set, Tuple
 from urllib.parse import urljoin
 from datetime import datetime, timezone
 import requests
@@ -16,10 +16,12 @@ try:
 except Exception:
     tqdm = None
 
-API_TIMEOUT = 30
-DEFAULT_PAGE_SIZE = 50
-PROJECT_PAGE_SIZE = 50
-GROUP_PAGE_SIZE = 100
+# -----------------------
+# Helpers
+# -----------------------
+
+def str2bool(s: str) -> bool:
+    return str(s).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 def backoff_sleep(resp, attempt):
     retry_after = resp.headers.get("Retry-After")
@@ -35,25 +37,8 @@ def backoff_sleep(resp, attempt):
 def parse_jira_time(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z",
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%S.%fZ",
-                "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if dt.tzinfo is None:
-                return dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except ValueError:
-            continue
     try:
-        if s.endswith("Z"):
-            s2 = s[:-1] + "+00:00"
-        elif len(s) > 5 and (s[-5] in ["+", "-"]) and s[-2:] != ":":
-            s2 = s[:-2] + ":" + s[-2:]
-        else:
-            s2 = s
-        dt = datetime.fromisoformat(s2)
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
@@ -63,372 +48,393 @@ def parse_jira_time(s: Optional[str]) -> Optional[datetime]:
 def dt_to_iso(dt: Optional[datetime]) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if dt else ""
 
-def is_http_400(err: Exception) -> bool:
-    return isinstance(err, requests.HTTPError) and getattr(err.response, "status_code", None) == 400
-
 def quote_aaid(account_id: str) -> str:
-    # Some sites require quoting AAIDs when used in JQL user fields (esp. with `was`).
-    return f'"{account_id}"'
+    # Account IDs can contain ':'; safe for path segments
+    return requests.utils.requote_uri(account_id)
+
+# -----------------------
+# Jira Client
+# -----------------------
+
+PROJECT_PAGE_SIZE = 50
+GROUP_PAGE_SIZE = 100
 
 class JiraClient:
-    def __init__(self, base_url: str, email: str, api_token: str):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url: str, email: str, token: str, verbose: bool = False):
+        self.base_url = base_url.rstrip("/") + "/"
         self.session = requests.Session()
-        self.session.auth = HTTPBasicAuth(email, api_token)
-        self.session.headers.update({"Accept": "application/json"})
-        # caches
-        self._group_members_cache: Dict[str, Set[str]] = {}
-        self._role_map_cache: Dict[str, Dict[str, str]] = {}
-        self._role_members_cache: Dict[Tuple[str, bool], Dict[str, Set[str]]] = {}
+        self.session.auth = HTTPBasicAuth(email, token)
+        self.session.headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "export-jira-contributors/1.0"
+        })
+        self.verbose = verbose
 
-    def _get(self, path_or_url: str, params: Optional[Dict] = None):
-        url = path_or_url if path_or_url.startswith("http") else urljoin(self.base_url + "/", path_or_url.lstrip("/"))
-        for attempt in range(6):
-            resp = self.session.get(url, params=params, timeout=API_TIMEOUT)
-            if resp.status_code in (429,) or 500 <= resp.status_code < 600:
+    def _get(self, path: str, params: Optional[dict] = None):
+        url = urljoin(self.base_url, path.lstrip("/"))
+        if self.verbose:
+            print(f"[DEBUG] GET {url} params={params}")
+        resp = self.session.get(url, params=params)
+        if resp.status_code == 429:
+            attempt = 1
+            while resp.status_code == 429 and attempt <= 6:
+                if self.verbose:
+                    print(f"[DEBUG] 429 from {url}, backing off (attempt {attempt})")
                 backoff_sleep(resp, attempt)
-                continue
-            resp.raise_for_status()
-            if resp.text and resp.headers.get("Content-Type", "").startswith("application/json"):
-                return resp.json()
-            return None
-        raise RuntimeError(f"GET {url} failed after retries")
+                resp = self.session.get(url, params=params)
+                attempt += 1
+        # Helpful debug before raising
+        if self.verbose:
+            try:
+                print(f"[DEBUG] {url} -> {resp.status_code} {resp.text[:200]}...")
+            except Exception:
+                pass
+        resp.raise_for_status()
+        return resp.json()
 
-    # ----- Projects -----
-    def iter_projects(self) -> Iterable[Dict]:
+    def iter_projects(self) -> Iterable[dict]:
         start_at = 0
         while True:
-            data = self._get("/rest/api/3/project/search", params={"startAt": start_at, "maxResults": PROJECT_PAGE_SIZE})
-            values = (data or {}).get("values", [])
-            for proj in values:
-                yield proj
-            if not values or data.get("isLast", True):
+            data = self._get("/rest/api/3/project/search",
+                             params={"startAt": start_at, "maxResults": PROJECT_PAGE_SIZE})
+            values = data.get("values") or []
+            if not values:
                 break
-            start_at += data.get("maxResults", PROJECT_PAGE_SIZE)
-
-    # ----- Users with BROWSE_PROJECTS -----
-    def iter_users_with_browse(self, project_key: str, include_inactive: bool = False) -> Iterable[Dict]:
-        start_at = 0
-        page_size = 1000
-        while start_at < 1000:
-            users = self._get(
-                "/rest/api/3/user/permission/search",
-                params={
-                    "projectKey": project_key,
-                    "permissions": "BROWSE_PROJECTS",
-                    "startAt": start_at,
-                    "maxResults": page_size,
-                },
-            )
-            if not users:
+            for p in values:
+                yield p
+            if len(values) < PROJECT_PAGE_SIZE:
                 break
-            count = 0
-            for u in users:
-                count += 1
-                if (u.get("accountType") or "").lower() == "app":
-                    continue
-                if include_inactive or u.get("active", True):
-                    yield u
-            if count < page_size:
-                break
-            start_at += page_size
+            start_at += PROJECT_PAGE_SIZE
 
-    # ----- Search issues -----
-    def search_issues(self, jql: str, start_at: int = 0, max_results: int = DEFAULT_PAGE_SIZE,
-                      fields: Optional[Iterable[str]] = None, expand: Optional[Iterable[str]] = None) -> Dict:
-        params = {"jql": jql, "startAt": start_at, "maxResults": max_results}
-        if fields is not None:
-            params["fields"] = ",".join(fields)
-        if expand is not None:
-            params["expand"] = ",".join(expand)
-        return self._get("/rest/api/3/search", params=params) or {}
-
-    # ----- Roles: map + members (expand groups) -----
-    def get_project_roles_map(self, project_key: str) -> Dict[str, str]:
-        if project_key in self._role_map_cache:
-            return self._role_map_cache[project_key]
-        data = self._get(f"/rest/api/3/project/{project_key}/role") or {}
-        role_map = {name: url for name, url in data.items()}
-        self._role_map_cache[project_key] = role_map
-        return role_map
-
-    def _expand_group_members(self, group_id: Optional[str], group_name: Optional[str], include_inactive: bool) -> Set[str]:
-        cache_key = f"id:{group_id}" if group_id else f"name:{group_name}"
-        if cache_key in self._group_members_cache:
-            return self._group_members_cache[cache_key]
-
-        params = {
-            "startAt": 0,
-            "maxResults": GROUP_PAGE_SIZE,
-            "includeInactiveUsers": str(include_inactive).lower()
-        }
-        if group_id:
-            params["groupId"] = group_id
-        elif group_name:
-            params["groupname"] = group_name
-
-        members: Set[str] = set()
-        try:
-            while True:
-                data = self._get("/rest/api/3/group/member", params=params) or {}
-                vals = data.get("values", []) or []
-                for m in vals:
-                    acc = m.get("accountId")
-                    if acc:
-                        members.add(acc)
-                start_at = data.get("startAt", 0)
-                max_results = data.get("maxResults", GROUP_PAGE_SIZE)
-                total = data.get("total", start_at + len(vals))
-                if start_at + max_results >= total:
-                    break
-                params["startAt"] = start_at + max_results
-        except requests.HTTPError as e:
-            print(f"[WARN] Could not expand group members for {cache_key}: {e}", file=sys.stderr)
-
-        self._group_members_cache[cache_key] = members
-        return members
-
-    def get_project_role_members(self, project_key: str, include_inactive: bool = False) -> Dict[str, Set[str]]:
-        cache_key = (project_key, include_inactive)
-        if cache_key in self._role_members_cache:
-            return self._role_members_cache[cache_key]
-
+    def get_project_role_members(self, project_key: str) -> Dict[str, Set[str]]:
+        roles = self._get(f"/rest/api/3/project/{project_key}/role")
         out: Dict[str, Set[str]] = {}
-        role_map = self.get_project_roles_map(project_key)
-        for role_name, role_url in role_map.items():
+        for role_name, role_url in roles.items():
             try:
-                role = self._get(role_url) or {}
+                r = self.session.get(role_url)
+                if r.status_code == 429:
+                    attempt = 1
+                    while r.status_code == 429 and attempt <= 6:
+                        backoff_sleep(r, attempt)
+                        r = self.session.get(role_url)
+                        attempt += 1
+                r.raise_for_status()
+                actors = r.json().get("actors") or []
+                ids: Set[str] = set()
+                for m in actors:
+                    if m.get("type") == "atlassian-user-role-actor":
+                        if m.get("actorUser") and m["actorUser"].get("accountId"):
+                            ids.add(m["actorUser"]["accountId"])
+                out[role_name] = ids
             except requests.HTTPError as e:
-                print(f"[WARN] Failed to fetch role '{role_name}' for {project_key}: {e}", file=sys.stderr)
+                print(f"[WARN] Failed to load role {role_name} in {project_key}: {e}")
                 continue
-
-            members: Set[str] = set()
-            for actor in role.get("actors", []) or []:
-                atype = actor.get("type")
-                if atype == "atlassian-user-role-actor":
-                    acc = (actor.get("actorUser") or {}).get("accountId")
-                    if acc:
-                        members.add(acc)
-                elif atype == "atlassian-group-role-actor":
-                    grp = actor.get("actorGroup") or {}
-                    gid = grp.get("groupId")
-                    gname = grp.get("name") or actor.get("name")
-                    members |= self._expand_group_members(gid, gname, include_inactive)
-            out[role_name] = members
-
-        self._role_members_cache[cache_key] = out
         return out
 
-class AtlassianAdminClient:
-    """
-    Organization Admin API for last-active dates (per product).
-    Requires an org-level API key and the correct org ID.
-    """
-    def __init__(self, org_id: Optional[str], api_key: Optional[str]):
-        self.org_id = (org_id or "").strip()
-        self.enabled = bool(self.org_id and api_key)
-        self.base_url = "https://api.atlassian.com/admin/v1"
-        self.session = requests.Session()
-        if api_key:
-            self.session.headers.update({
-                "Authorization": f"Bearer {api_key}",
-                "Accept": "application/json",
-            })
-        self._cache: Dict[str, Optional[datetime]] = {}
+    def iter_users_with_browse(self, project_key: str, include_inactive: bool = False) -> Iterable[dict]:
+        # This enumerates site users; substitute with a more precise per-project API if available in your plan.
+        start_at = 0
+        while True:
+            data = self._get("/rest/api/3/users/search",
+                             params={"startAt": start_at, "maxResults": GROUP_PAGE_SIZE})
+            if not isinstance(data, list) or not data:
+                break
+            for u in data:
+                if include_inactive or u.get("active", True):
+                    yield u
+            if len(data) < GROUP_PAGE_SIZE:
+                break
+            start_at += GROUP_PAGE_SIZE
 
-    def _get(self, path: str, params: Optional[Dict] = None):
-        url = self.base_url + path
-        for attempt in range(6):
-            resp = self.session.get(url, params=params, timeout=API_TIMEOUT)
-            if resp.status_code in (429,) or 500 <= resp.status_code < 600:
-                backoff_sleep(resp, attempt)
-                continue
-            resp.raise_for_status()
-            if resp.text and resp.headers.get("Content-Type", "").startswith("application/json"):
-                return resp.json()
-            return None
-        raise RuntimeError(f"GET {url} failed after retries")
+# -----------------------
+# Atlassian Admin API client (last active)
+# -----------------------
+
+class AtlassianAdminClient:
+    def __init__(self, org_id: Optional[str], api_key: Optional[str], verbose: bool = False):
+        self.org_id = org_id
+        self.api_key = api_key
+        self.enabled = bool(org_id and api_key)
+        self.verbose = verbose
+        self.session = requests.Session()
+        self._cache: Dict[str, Optional[datetime]] = {}
+        if self.enabled:
+            self.session.headers.update({
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "export-jira-contributors/1.0"
+            })
 
     def get_last_active_any_product(self, account_id: str) -> Optional[datetime]:
         if not self.enabled:
             return None
         if account_id in self._cache:
             return self._cache[account_id]
+
+        url = f"https://api.atlassian.com/admin/v1/orgs/{self.org_id}/directory/users/{quote_aaid(account_id)}/last-active-dates"
+        if self.verbose:
+            print(f"[DEBUG] GET {url} (Admin API)")
+        r = self.session.get(url)
+        if r.status_code == 429:
+            attempt = 1
+            while r.status_code == 429 and attempt <= 6:
+                if self.verbose:
+                    print(f"[DEBUG] Admin API 429, backoff (attempt {attempt})")
+                backoff_sleep(r, attempt)
+                r = self.session.get(url)
+                attempt += 1
+        if self.verbose:
+            try:
+                print(f"[DEBUG] Admin API -> {r.status_code} {r.text[:200]}...")
+            except Exception:
+                pass
         try:
-            data = self._get(f"/orgs/{self.org_id}/directory/users/{account_id}/last-active-dates") or {}
+            r.raise_for_status()
         except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status == 403:
-                print(
-                    f"[WARN] last-active lookup failed for {account_id}: 403 Forbidden. "
-                    f"Check that the API key belongs to an Org Admin, org ID is correct, "
-                    f"and the user is a managed account in that org.", file=sys.stderr
-                )
-            else:
-                print(f"[WARN] last-active lookup failed for {account_id}: {e}", file=sys.stderr)
+            print(f"[WARN] Admin API failed for {account_id}: {e}")
             self._cache[account_id] = None
             return None
 
-        product_access = ((data.get("data") or {}).get("product_access")) or []
-        best = None
-        for pa in product_access:
-            ts = pa.get("last_active_timestamp") or pa.get("last_active")
-            dt = parse_jira_time(ts)
-            if dt and (best is None or dt > best):
-                best = dt
-        self._cache[account_id] = best
-        return best
+        data = r.json() or {}
+        # Endpoint typically returns an object with product keys -> dates; choose the max
+        # Fallback if a list or single value is returned.
+        last_dt: Optional[datetime] = None
+        try:
+            if isinstance(data, dict):
+                for _, v in data.items():
+                    # v could be a date string or nested structure
+                    if isinstance(v, str):
+                        dt = parse_jira_time(v)
+                        if dt and (last_dt is None or dt > last_dt):
+                            last_dt = dt
+                    elif isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, str):
+                                dt = parse_jira_time(item)
+                                if dt and (last_dt is None or dt > last_dt):
+                                    last_dt = dt
+                    elif isinstance(v, dict):
+                        for vv in v.values():
+                            if isinstance(vv, str):
+                                dt = parse_jira_time(vv)
+                                if dt and (last_dt is None or dt > last_dt):
+                                    last_dt = dt
+            elif isinstance(data, list):
+                for v in data:
+                    if isinstance(v, str):
+                        dt = parse_jira_time(v)
+                        if dt and (last_dt is None or dt > last_dt):
+                            last_dt = dt
+        except Exception:
+            pass
 
-def str2bool(v: Optional[str], default: bool = False) -> bool:
-    if v is None:
-        return default
-    return str(v).strip().lower() in {"1","true","t","yes","y","on"}
+        self._cache[account_id] = last_dt
+        return last_dt
+
+# -----------------------
+# Resume helpers
+# -----------------------
+
+def load_processed_keys(out_csv: str) -> Tuple[Set[Tuple[str, str]], bool]:
+    """
+    Returns (processed_set, has_account_id_column).
+    processed_set contains (project_key, account_id) tuples already in the CSV if possible,
+    otherwise falls back to (project_key, display_name).
+    """
+    processed: Set[Tuple[str, str]] = set()
+    has_acc = False
+    if not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0:
+        return processed, has_acc
+
+    with open(out_csv, "r", newline="", encoding="utf-8") as rf:
+        reader = csv.reader(rf)
+        header = next(reader, None) or []
+        lower = [h.lower() for h in header]
+        try:
+            pkey_i = lower.index("project key")
+        except ValueError:
+            return processed, has_acc
+
+        acc_i = lower.index("account id") if "account id" in lower else -1
+        if acc_i >= 0:
+            has_acc = True
+            for row in reader:
+                if len(row) > max(pkey_i, acc_i):
+                    processed.add((row[pkey_i], row[acc_i]))
+        else:
+            # fallback to display name
+            try:
+                uname_i = lower.index("user name")
+                for row in reader:
+                    if len(row) > max(pkey_i, uname_i):
+                        processed.add((row[pkey_i], row[uname_i]))
+            except ValueError:
+                pass
+    return processed, has_acc
+
+# -----------------------
+# Activity
+# -----------------------
+
+def get_issue_latest_activity(jc: JiraClient, issue_key: str, verbose: bool = False) -> Optional[datetime]:
+    try:
+        data = jc._get(f"/rest/api/3/issue/{issue_key}",
+                       params={"expand": "renderedFields,changelog"})
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 400:
+            return None
+        raise
+    fields = data.get("fields") or {}
+    updated = parse_jira_time(fields.get("updated"))
+    latest = updated
+    ch = data.get("changelog") or {}
+    for h in ch.get("histories") or []:
+        created_dt = parse_jira_time(h.get("created"))
+        if created_dt and (latest is None or created_dt > latest):
+            latest = created_dt
+    if verbose:
+        print(f"[DEBUG] Issue {issue_key} latest activity: {latest}")
+    return latest
 
 def get_latest_user_activity_in_project(jc: JiraClient, project_key: str, account_id: str,
-                                        max_issue_scan: int = 500) -> Optional[datetime]:
-    """
-    Returns the latest UTC timestamp where the user either created an issue in the project
-    or authored an update on an issue they were ever assignee/reporter on.
-    If a 400 occurs in any JQL call, we log a WARN and SKIP this user (return None).
-    """
-    aaid = quote_aaid(account_id)
-
-    # 1) newest issue CREATED by the user
-    created_dt = None
-    try:
-        jql_created = f'project = "{project_key}" AND creator = {aaid} ORDER BY created DESC'
-        data_created = jc.search_issues(jql_created, start_at=0, max_results=1, fields=["created"])
-        issues_c = data_created.get("issues", [])
-        if issues_c:
-            created_dt = parse_jira_time(((issues_c[0] or {}).get("fields") or {}).get("created"))
-    except requests.HTTPError as e:
-        if is_http_400(e):
-            print(f"[WARN] 400 on created-scan; skipping user {account_id} in {project_key}", file=sys.stderr)
-            return None
-        raise
-
-    # 2) latest UPDATE authored by the user on issues they were ever assignee/reporter
-    jql_updated = (
-        f'project = "{project_key}" '
-        f'AND (assignee was {aaid} OR reporter was {aaid}) '
-        f'ORDER BY updated DESC'
-    )
-
-    scanned = 0
+                                        max_issue_scan: int = 500, verbose: bool = False) -> Optional[datetime]:
+    jql = f"project={project_key} AND assignee={account_id}"
     start_at = 0
-    best_dt = None
-
-    try:
-        while scanned < max_issue_scan:
-            data = jc.search_issues(jql_updated, start_at=start_at, max_results=DEFAULT_PAGE_SIZE,
-                                    fields=["updated"], expand=["changelog"])
-            issues = data.get("issues", [])
-            if not issues:
+    best_dt: Optional[datetime] = None
+    scanned = 0
+    while scanned < max_issue_scan:
+        try:
+            resp = jc._get("/rest/api/3/search/jql",
+                           params={"jql": jql, "startAt": start_at,
+                                   "maxResults": 50, "expand": "changelog"})
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
                 break
-            for issue in issues:
-                scanned += 1
-                histories = (((issue or {}).get("changelog") or {}).get("histories")) or []
-                latest_by_user = None
-                for h in histories:
-                    if (h.get("author") or {}).get("accountId") == account_id:
-                        dt = parse_jira_time(h.get("created"))
-                        if dt and (latest_by_user is None or dt > latest_by_user):
-                            latest_by_user = dt
-                if latest_by_user and (best_dt is None or latest_by_user > best_dt):
-                    best_dt = latest_by_user
-            if len(issues) < DEFAULT_PAGE_SIZE:
+            raise
+        issues = resp.get("issues") or []
+        if not issues:
+            break
+        for issue in issues:
+            scanned += 1
+            latest = get_issue_latest_activity(jc, issue.get("key"), verbose)
+            if latest and (best_dt is None or latest > best_dt):
+                best_dt = latest
+            if scanned >= max_issue_scan:
                 break
-            start_at += DEFAULT_PAGE_SIZE
-    except requests.HTTPError as e:
-        if is_http_400(e):
-            print(f"[WARN] 400 on update-scan; skipping user {account_id} in {project_key}", file=sys.stderr)
-            return None
-        raise
-
-    # 3) pick later of created vs updated
-    if created_dt and (not best_dt or created_dt >= best_dt):
-        return created_dt
+        if len(issues) < 50:
+            break
+        start_at += 50
+    if verbose:
+        print(f"[DEBUG] User {account_id} in {project_key} latest: {best_dt}")
     return best_dt
 
-def export_contributors(base_url: str, email: str, token: str, out_csv: str,
-                        include_inactive: bool = False, try_email_lookup: bool = False,
-                        max_issue_scan: int = 500, show_progress: bool = True,
-                        org_id: Optional[str] = None, admin_api_key: Optional[str] = None):
-    jc = JiraClient(base_url, email, token)
-    admin = AtlassianAdminClient(org_id, admin_api_key)
+# -----------------------
+# Export
+# -----------------------
 
-    if not admin.enabled:
-        print("[WARN] Org admin API is not configured; 'last active (UTC)' will be blank. "
-              "Set ATLASSIAN_ORG_ID and ATLASSIAN_API_KEY in .env", file=sys.stderr)
+def export_contributors(base_url: str, email: str, token: str, out_csv: str,
+                        include_inactive: bool = False, max_issue_scan: int = 500,
+                        show_progress: bool = True, resume: bool = False,
+                        verbose: bool = False,
+                        org_id: Optional[str] = None, org_api_key: Optional[str] = None):
+    jc = JiraClient(base_url, email, token, verbose)
+    admin = AtlassianAdminClient(org_id, org_api_key, verbose)
 
     projects = list(jc.iter_projects())
+    if verbose:
+        print(f"[INFO] Found {len(projects)} projects")
+
     proj_iter = tqdm(projects, desc="Projects", unit="proj") if show_progress and tqdm else projects
 
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    append_mode = os.path.exists(out_csv) and os.path.getsize(out_csv) > 0
+    mode = "a" if append_mode else "w"
+
+    processed_keys, has_acc = (set(), False)
+    if resume and append_mode:
+        processed_keys, has_acc = load_processed_keys(out_csv)
+        if verbose:
+            print(f"[INFO] Resume loaded {len(processed_keys)} existing rows (has account id column: {has_acc})")
+
+    with open(out_csv, mode, newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        header = ["project name", "project key", "user name", "email",
-                  "last worked (UTC)", "last active (UTC)", "Roles"]
-        writer.writerow(header)
+        if not append_mode:
+            writer.writerow(["project name", "project key", "user name",
+                             "email", "last worked (UTC)", "last active (UTC)",
+                             "Roles", "account id"])
 
         for proj in proj_iter:
-            pkey = proj.get("key") or proj.get("id")
+            pkey = proj.get("key")
             pname = proj.get("name") or pkey
-            if not pkey:
-                continue
-
-            # Preload project role membership (expands groups)
+            if verbose:
+                print(f"[INFO] Processing project {pkey} - {pname}")
             try:
-                role_members = jc.get_project_role_members(pkey, include_inactive=include_inactive)
-            except requests.HTTPError as e:
-                print(f"[WARN] Failed to load roles for {pkey}: {e}", file=sys.stderr)
+                role_members = jc.get_project_role_members(pkey)
+            except Exception as e:
+                print(f"[WARN] Roles failed for {pkey}: {e}")
                 role_members = {}
 
-            users = list(jc.iter_users_with_browse(pkey, include_inactive=include_inactive))
-            user_iter = tqdm(users, desc=f"{pkey} users", leave=False, unit="user") if show_progress and tqdm else users
-
-            email_cache: Dict[str, Optional[str]] = {}
-
-            for user in user_iter:
+            users = jc.iter_users_with_browse(pkey, include_inactive=include_inactive)
+            for user in users:
                 acc_id = user.get("accountId")
                 if not acc_id:
                     continue
+
+                # 🚫 Skip plugin/app users
+                if user.get("accountType") == "app":
+                    if verbose:
+                        print(f"[SKIP] Plugin user {user.get('displayName')} ({acc_id})")
+                    continue
+
                 display_name = user.get("displayName") or user.get("name") or ""
                 email_address = user.get("emailAddress") or ""
-                if not email_address and try_email_lookup:
-                    if acc_id not in email_cache:
-                        try:
-                            email_cache[acc_id] = jc._get("/rest/api/3/user/email", params={"accountId": acc_id}).get("email")
-                        except Exception:
-                            email_cache[acc_id] = None
-                    email_address = email_cache.get(acc_id) or ""
+
+                # Resume key: prefer (project_key, account_id)
+                resume_key = (pkey, acc_id) if has_acc or not append_mode else (pkey, display_name)
+                if resume and resume_key in processed_keys:
+                    if verbose:
+                        print(f"[SKIP] {pkey}-{display_name} (resume)")
+                    continue
 
                 last_worked_dt = get_latest_user_activity_in_project(
-                    jc, pkey, acc_id, max_issue_scan=max_issue_scan
-                )
-                # if 400 occurred, function returns None; we still write the row
+                    jc, pkey, acc_id, max_issue_scan=max_issue_scan, verbose=verbose)
 
                 last_active_dt = admin.get_last_active_any_product(acc_id)
 
-                user_roles = sorted([rname for rname, members in (role_members or {}).items() if acc_id in members])
+                user_roles = sorted([r for r, members in role_members.items() if acc_id in members])
                 roles_str = "; ".join(user_roles)
 
-                writer.writerow([
-                    pname, pkey, display_name, email_address,
-                    dt_to_iso(last_worked_dt), dt_to_iso(last_active_dt), roles_str
-                ])
+                row = [pname, pkey, display_name, email_address,
+                       dt_to_iso(last_worked_dt), dt_to_iso(last_active_dt), roles_str, acc_id]
+                writer.writerow(row)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+                if verbose:
+                    print(f"[WRITE] {pkey}-{display_name}")
+
+                if resume:
+                    processed_keys.add(resume_key)
+
+# -----------------------
+# CLI
+# -----------------------
 
 def main():
     load_dotenv(find_dotenv(usecwd=True))
 
-    parser = argparse.ArgumentParser(description="Export Jira Cloud contributors with latest activity, last login, and project roles (.env supported).")
+    parser = argparse.ArgumentParser(description="Export Jira contributors with resume + logging + Admin 'last active' (skips plugin users)")
     parser.add_argument("--base-url", default=os.environ.get("JIRA_BASE_URL"))
     parser.add_argument("--email", default=os.environ.get("JIRA_EMAIL"))
     parser.add_argument("--api-token", default=os.environ.get("JIRA_API_TOKEN"))
-    parser.add_argument("-o", "--out", default=os.environ.get("OUTPUT_CONTRIBUTORS", os.environ.get("OUT", "jira_contributors.csv")))
+    parser.add_argument("-o", "--out", default=os.environ.get("OUT_CONTRIBUTORS", "jira_contributors.csv"))
     parser.add_argument("--include-inactive", action="store_true", default=str2bool(os.environ.get("INCLUDE_INACTIVE", "false")))
-    parser.add_argument("--try-email-lookup", action="store_true", default=str2bool(os.environ.get("TRY_EMAIL_LOOKUP", "false")))
     parser.add_argument("--max-issue-scan", type=int, default=int(os.environ.get("MAX_ISSUE_SCAN", "500")))
     parser.add_argument("--no-progress", action="store_true", default=str2bool(os.environ.get("NO_PROGRESS", "false")))
+    parser.add_argument("--resume", action="store_true", default=str2bool(os.environ.get("RESUME", "false")))
+    parser.add_argument("--verbose", action="store_true", default=str2bool(os.environ.get("VERBOSE", "false")))
     parser.add_argument("--org-id", default=os.environ.get("ATLASSIAN_ORG_ID"))
     parser.add_argument("--org-api-key", default=os.environ.get("ATLASSIAN_API_KEY"))
     args = parser.parse_args()
@@ -439,24 +445,15 @@ def main():
         "JIRA_API_TOKEN": args.api_token,
     }.items() if not v]
     if missing:
-        print("Missing required configuration: " + ", ".join(missing), file=sys.stderr)
-        print("Tip: set them in .env or pass as CLI flags.", file=sys.stderr)
+        print("Missing required settings: " + ", ".join(missing), file=sys.stderr)
         sys.exit(2)
 
-    show_progress = (not args.no_progress)
-    if tqdm is None and show_progress:
-        print("[WARN] tqdm not installed; progress bars disabled. Install with: pip install tqdm", file=sys.stderr)
-        show_progress = False
+    show_progress = not args.no_progress
 
-    try:
-        export_contributors(args.base_url, args.email, args.api_token, args.out,
-                            include_inactive=args.include_inactive, try_email_lookup=args.try_email_lookup,
-                            max_issue_scan=args.max_issue_scan, show_progress=show_progress,
-                            org_id=args.org_id, admin_api_key=args.org_api_key)
-        print(f"Done. Wrote: {args.out}")
-    except requests.HTTPError as e:
-        print(f"HTTP error: {e} – response: {getattr(e, 'response', None) and e.response.text}", file=sys.stderr)
-        sys.exit(1)
+    export_contributors(args.base_url, args.email, args.api_token, args.out,
+                        include_inactive=args.include_inactive, max_issue_scan=args.max_issue_scan,
+                        show_progress=show_progress, resume=args.resume, verbose=args.verbose,
+                        org_id=args.org_id, org_api_key=args.org_api_key)
 
 if __name__ == "__main__":
     main()
