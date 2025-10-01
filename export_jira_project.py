@@ -52,6 +52,32 @@ def quote_aaid(account_id: str) -> str:
     # Account IDs can contain ':'; safe for path segments
     return requests.utils.requote_uri(account_id)
 
+def is_probably_html(text: str) -> bool:
+    t = (text or "").strip().lower()
+    # quick-and-dirty detection for login/proxy pages
+    return ("<html" in t) or ("<!doctype html" in t) or ("<title" in t)
+
+def raise_non_json_200(url: str, resp: requests.Response, verbose: bool):
+    ctype = resp.headers.get("Content-Type", "")
+    snippet = ""
+    try:
+        snippet = resp.text[:800]
+    except Exception:
+        snippet = "<non-text body>"
+    msg = [
+        f"Expected JSON but got non-JSON response (HTTP 200) from: {url}",
+        f"Content-Type: {ctype or '<none>'}",
+    ]
+    if is_probably_html(snippet):
+        msg.append("Body looks like HTML (often an SSO/proxy login page or block page).")
+    if verbose:
+        msg.append("Body snippet:\n" + snippet)
+    msg.append(
+        "Hints: ensure you are calling the correct Jira Cloud URL, your API token is valid and belongs to the same account, "
+        "and any corporate proxy/SSO is not intercepting this API path. If a proxy rewrites TLS, set CA_BUNDLE to your corp root (PEM)."
+    )
+    raise RuntimeError("\n".join(msg))
+
 # -----------------------
 # Jira Client
 # -----------------------
@@ -80,7 +106,7 @@ class JiraClient:
             "User-Agent": "export-jira-contributors/1.0"
         })
         # ---- TLS / cert handling ----
-        # verify can be: True/False or path to CA bundle (PEM)
+        # verify can be: True/False or path to CA bundle (PEM). .crt is fine if PEM-encoded.
         self.session.verify = False if insecure else (ca_bundle if ca_bundle else True)
         # client cert: tuple(cert, key) or single file (combined PEM)
         if client_cert and client_key:
@@ -94,23 +120,50 @@ class JiraClient:
         url = urljoin(self.base_url, path.strip("/"))
         if self.verbose:
             print(f"[DEBUG] GET {url} params={params}")
-        resp = self.session.get(url, params=params)
+            if self.session.verify is True:
+                print("[DEBUG] TLS verify: system CAs")
+            elif self.session.verify is False:
+                print("[DEBUG] TLS verify: DISABLED (insecure)")
+            else:
+                print(f"[DEBUG] TLS verify: CA bundle -> {self.session.verify}")
+            if getattr(self.session, "cert", None):
+                print(f"[DEBUG] mTLS client cert configured: {self.session.cert}")
+
+        resp = self.session.get(url, params=params, allow_redirects=True)
         if resp.status_code == 429:
             attempt = 1
             while resp.status_code == 429 and attempt <= 6:
                 if self.verbose:
                     print(f"[DEBUG] 429 from {url}, backing off (attempt {attempt})")
                 backoff_sleep(resp, attempt)
-                resp = self.session.get(url, params=params)
+                resp = self.session.get(url, params=params, allow_redirects=True)
                 attempt += 1
-        # Helpful debug before raising
+
+        # Debug before raising / parsing:
         if self.verbose:
             try:
-                print(f"[DEBUG] {url} -> {resp.status_code} {resp.text[:200]}...")
+                print(f"[DEBUG] {url} -> {resp.status_code} CT={resp.headers.get('Content-Type','')}")
             except Exception:
                 pass
-        resp.raise_for_status()
-        return resp.json()
+
+        # Raise for non-2xx
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            # Show snippet for 4xx/5xx as well
+            if self.verbose:
+                try:
+                    print(f"[DEBUG] Body: {resp.text[:800]}")
+                except Exception:
+                    pass
+            raise
+
+        # Try parse JSON
+        try:
+            return resp.json()
+        except ValueError:
+            # 200 but not JSON -> likely HTML login/proxy or content-type mismatch
+            raise_non_json_200(url, resp, self.verbose)
 
     def iter_projects(self) -> Iterable[dict]:
         start_at = 0
@@ -131,15 +184,20 @@ class JiraClient:
         out: Dict[str, Set[str]] = {}
         for role_name, role_url in roles.items():
             try:
-                r = self.session.get(role_url)
+                r = self.session.get(role_url, allow_redirects=True)
                 if r.status_code == 429:
                     attempt = 1
                     while r.status_code == 429 and attempt <= 6:
                         backoff_sleep(r, attempt)
-                        r = self.session.get(role_url)
+                        r = self.session.get(role_url, allow_redirects=True)
                         attempt += 1
                 r.raise_for_status()
-                actors = r.json().get("actors") or []
+                # When endpoints return 200 but HTML (proxy), catch here too
+                try:
+                    payload = r.json()
+                except ValueError:
+                    raise_non_json_200(role_url, r, self.verbose)
+                actors = payload.get("actors") or []
                 ids: Set[str] = set()
                 for m in actors:
                     if m.get("type") == "atlassian-user-role-actor":
@@ -152,7 +210,6 @@ class JiraClient:
         return out
 
     def iter_users_with_browse(self, project_key: str, include_inactive: bool = False) -> Iterable[dict]:
-        # This enumerates site users; substitute with a more precise per-project API if available in your plan.
         start_at = 0
         while True:
             data = self._get("/rest/api/3/users/search",
@@ -210,18 +267,18 @@ class AtlassianAdminClient:
         url = f"https://api.atlassian.com/admin/v1/orgs/{self.org_id}/directory/users/{quote_aaid(account_id)}/last-active-dates"
         if self.verbose:
             print(f"[DEBUG] GET {url} (Admin API)")
-        r = self.session.get(url)
+        r = self.session.get(url, allow_redirects=True)
         if r.status_code == 429:
             attempt = 1
             while r.status_code == 429 and attempt <= 6:
                 if self.verbose:
                     print(f"[DEBUG] Admin API 429, backoff (attempt {attempt})")
                 backoff_sleep(r, attempt)
-                r = self.session.get(url)
+                r = self.session.get(url, allow_redirects=True)
                 attempt += 1
         if self.verbose:
             try:
-                print(f"[DEBUG] Admin API -> {r.status_code} {r.text[:200]}...")
+                print(f"[DEBUG] Admin API -> {r.status_code} CT={r.headers.get('Content-Type','')}")
             except Exception:
                 pass
         try:
@@ -231,35 +288,35 @@ class AtlassianAdminClient:
             self._cache[account_id] = None
             return None
 
-        data = r.json() or {}
-        # Endpoint typically returns an object with product keys -> dates; choose the max
-        # Fallback if a list or single value is returned.
+        try:
+            data = r.json() or {}
+        except ValueError:
+            # Admin API also could be proxied to HTML if intercepted
+            try:
+                raise_non_json_200(url, r, self.verbose)
+            except RuntimeError as ex:
+                print(f"[WARN] {ex}")
+                self._cache[account_id] = None
+                return None
+
         last_dt: Optional[datetime] = None
         try:
             if isinstance(data, dict):
                 for _, v in data.items():
                     if isinstance(v, str):
-                        dt = parse_jira_time(v)
-                        if dt and (last_dt is None or dt > last_dt):
-                            last_dt = dt
+                        dt = parse_jira_time(v);  last_dt = max(last_dt, dt) if (last_dt and dt) else (dt or last_dt)
                     elif isinstance(v, list):
                         for item in v:
                             if isinstance(item, str):
-                                dt = parse_jira_time(item)
-                                if dt and (last_dt is None or dt > last_dt):
-                                    last_dt = dt
+                                dt = parse_jira_time(item);  last_dt = max(last_dt, dt) if (last_dt and dt) else (dt or last_dt)
                     elif isinstance(v, dict):
                         for vv in v.values():
                             if isinstance(vv, str):
-                                dt = parse_jira_time(vv)
-                                if dt and (last_dt is None or dt > last_dt):
-                                    last_dt = dt
+                                dt = parse_jira_time(vv);  last_dt = max(last_dt, dt) if (last_dt and dt) else (dt or last_dt)
             elif isinstance(data, list):
                 for v in data:
                     if isinstance(v, str):
-                        dt = parse_jira_time(v)
-                        if dt and (last_dt is None or dt > last_dt):
-                            last_dt = dt
+                        dt = parse_jira_time(v);  last_dt = max(last_dt, dt) if (last_dt and dt) else (dt or last_dt)
         except Exception:
             pass
 
@@ -478,17 +535,16 @@ def main():
     parser.add_argument("--org-id", default=os.environ.get("ATLASSIAN_ORG_ID"))
     parser.add_argument("--org-api-key", default=os.environ.get("ATLASSIAN_API_KEY"))
 
-    # ---- NEW: TLS / certificate options (env-driven, with CLI override) ----
+    # TLS / certificate options (env-driven, with CLI override)
     parser.add_argument("--ca-bundle", default=os.environ.get("CA_BUNDLE"),
-                        help="Path to custom CA bundle PEM used to verify server certificates")
+                        help="Path to custom CA bundle .crt/.pem (PEM) used to verify server certificates")
     parser.add_argument("--client-cert", default=os.environ.get("CLIENT_CERT"),
-                        help="Path to client certificate PEM (or combined cert+key PEM)")
+                        help="Path to client certificate PEM (or combined cert+key PEM) if proxy requires mTLS")
     parser.add_argument("--client-key", default=os.environ.get("CLIENT_KEY"),
                         help="Path to client private key PEM (if separate)")
     parser.add_argument("--insecure", action="store_true",
                         default=str2bool(os.environ.get("INSECURE", "false")),
                         help="Disable TLS verification (NOT recommended)")
-    # -----------------------------------------------------------------------
 
     args = parser.parse_args()
 
@@ -514,4 +570,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
