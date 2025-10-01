@@ -60,7 +60,17 @@ PROJECT_PAGE_SIZE = 50
 GROUP_PAGE_SIZE = 100
 
 class JiraClient:
-    def __init__(self, base_url: str, email: str, token: str, verbose: bool = False):
+    def __init__(
+        self,
+        base_url: str,
+        email: str,
+        token: str,
+        verbose: bool = False,
+        ca_bundle: Optional[str] = None,
+        client_cert: Optional[str] = None,
+        client_key: Optional[str] = None,
+        insecure: bool = False,
+    ):
         self.base_url = base_url.rstrip("/") + "/"
         self.session = requests.Session()
         self.session.auth = HTTPBasicAuth(email, token)
@@ -69,10 +79,19 @@ class JiraClient:
             "Content-Type": "application/json",
             "User-Agent": "export-jira-contributors/1.0"
         })
+        # ---- TLS / cert handling ----
+        # verify can be: True/False or path to CA bundle (PEM)
+        self.session.verify = False if insecure else (ca_bundle if ca_bundle else True)
+        # client cert: tuple(cert, key) or single file (combined PEM)
+        if client_cert and client_key:
+            self.session.cert = (client_cert, client_key)
+        elif client_cert:
+            self.session.cert = client_cert
+        # ------------------------------
         self.verbose = verbose
 
     def _get(self, path: str, params: Optional[dict] = None):
-        url = urljoin(self.base_url, path.lstrip("/"))
+        url = urljoin(self.base_url, path.strip("/"))
         if self.verbose:
             print(f"[DEBUG] GET {url} params={params}")
         resp = self.session.get(url, params=params)
@@ -152,13 +171,29 @@ class JiraClient:
 # -----------------------
 
 class AtlassianAdminClient:
-    def __init__(self, org_id: Optional[str], api_key: Optional[str], verbose: bool = False):
+    def __init__(
+        self,
+        org_id: Optional[str],
+        api_key: Optional[str],
+        verbose: bool = False,
+        ca_bundle: Optional[str] = None,
+        client_cert: Optional[str] = None,
+        client_key: Optional[str] = None,
+        insecure: bool = False,
+    ):
         self.org_id = org_id
         self.api_key = api_key
         self.enabled = bool(org_id and api_key)
         self.verbose = verbose
         self.session = requests.Session()
         self._cache: Dict[str, Optional[datetime]] = {}
+        # ---- TLS / cert handling ----
+        self.session.verify = False if insecure else (ca_bundle if ca_bundle else True)
+        if client_cert and client_key:
+            self.session.cert = (client_cert, client_key)
+        elif client_cert:
+            self.session.cert = client_cert
+        # ------------------------------
         if self.enabled:
             self.session.headers.update({
                 "Accept": "application/json",
@@ -203,7 +238,6 @@ class AtlassianAdminClient:
         try:
             if isinstance(data, dict):
                 for _, v in data.items():
-                    # v could be a date string or nested structure
                     if isinstance(v, str):
                         dt = parse_jira_time(v)
                         if dt and (last_dt is None or dt > last_dt):
@@ -337,9 +371,15 @@ def export_contributors(base_url: str, email: str, token: str, out_csv: str,
                         include_inactive: bool = False, max_issue_scan: int = 500,
                         show_progress: bool = True, resume: bool = False,
                         verbose: bool = False,
-                        org_id: Optional[str] = None, org_api_key: Optional[str] = None):
-    jc = JiraClient(base_url, email, token, verbose)
-    admin = AtlassianAdminClient(org_id, org_api_key, verbose)
+                        org_id: Optional[str] = None, org_api_key: Optional[str] = None,
+                        ca_bundle: Optional[str] = None, client_cert: Optional[str] = None,
+                        client_key: Optional[str] = None, insecure: bool = False):
+    jc = JiraClient(base_url, email, token, verbose,
+                    ca_bundle=ca_bundle, client_cert=client_cert,
+                    client_key=client_key, insecure=insecure)
+    admin = AtlassianAdminClient(org_id, org_api_key, verbose,
+                                 ca_bundle=ca_bundle, client_cert=client_cert,
+                                 client_key=client_key, insecure=insecure)
 
     projects = list(jc.iter_projects())
     if verbose:
@@ -437,6 +477,19 @@ def main():
     parser.add_argument("--verbose", action="store_true", default=str2bool(os.environ.get("VERBOSE", "false")))
     parser.add_argument("--org-id", default=os.environ.get("ATLASSIAN_ORG_ID"))
     parser.add_argument("--org-api-key", default=os.environ.get("ATLASSIAN_API_KEY"))
+
+    # ---- NEW: TLS / certificate options (env-driven, with CLI override) ----
+    parser.add_argument("--ca-bundle", default=os.environ.get("CA_BUNDLE"),
+                        help="Path to custom CA bundle PEM used to verify server certificates")
+    parser.add_argument("--client-cert", default=os.environ.get("CLIENT_CERT"),
+                        help="Path to client certificate PEM (or combined cert+key PEM)")
+    parser.add_argument("--client-key", default=os.environ.get("CLIENT_KEY"),
+                        help="Path to client private key PEM (if separate)")
+    parser.add_argument("--insecure", action="store_true",
+                        default=str2bool(os.environ.get("INSECURE", "false")),
+                        help="Disable TLS verification (NOT recommended)")
+    # -----------------------------------------------------------------------
+
     args = parser.parse_args()
 
     missing = [k for k, v in {
@@ -450,10 +503,14 @@ def main():
 
     show_progress = not args.no_progress
 
-    export_contributors(args.base_url, args.email, args.api_token, args.out,
-                        include_inactive=args.include_inactive, max_issue_scan=args.max_issue_scan,
-                        show_progress=show_progress, resume=args.resume, verbose=args.verbose,
-                        org_id=args.org_id, org_api_key=args.org_api_key)
+    export_contributors(
+        args.base_url, args.email, args.api_token, args.out,
+        include_inactive=args.include_inactive, max_issue_scan=args.max_issue_scan,
+        show_progress=show_progress, resume=args.resume, verbose=args.verbose,
+        org_id=args.org_id, org_api_key=args.org_api_key,
+        ca_bundle=args.ca_bundle, client_cert=args.client_cert,
+        client_key=args.client_key, insecure=args.insecure
+    )
 
 if __name__ == "__main__":
     main()
