@@ -4,24 +4,28 @@ import sys
 import csv
 import time
 import argparse
-from typing import Dict, Iterable, Optional, Set, Tuple, List
+from typing import Dict, Iterable, Optional, Set, Tuple
 from urllib.parse import urljoin
 from datetime import datetime, timezone
 import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv, find_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     from tqdm import tqdm  # progress bars
 except Exception:
     tqdm = None
 
-API_TIMEOUT = 30
-DEFAULT_PAGE_SIZE = 50
-PROJECT_PAGE_SIZE = 50
-GROUP_PAGE_SIZE = 100
+# -----------------------
+# Helpers
+# -----------------------
 
-def backoff_sleep(resp, attempt):
+def str2bool(s: str) -> bool:
+    return str(s).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def backoff_sleep(resp, attempt: int):
     retry_after = resp.headers.get("Retry-After")
     if retry_after:
         try:
@@ -32,431 +36,929 @@ def backoff_sleep(resp, attempt):
         sleep_s = 2 ** attempt
     time.sleep(min(sleep_s, 60))
 
+
 def parse_jira_time(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z",
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%S.%fZ",
-                "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            dt = datetime.strptime(s, fmt)
-            if dt.tzinfo is None:
-                return dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except ValueError:
-            continue
     try:
-        if s.endswith("Z"):
-            s2 = s[:-1] + "+00:00"
-        elif len(s) > 5 and (s[-5] in ["+", "-"]) and s[-2:] != ":":
-            s2 = s[:-2] + ":" + s[-2:]
-        else:
-            s2 = s
-        dt = datetime.fromisoformat(s2)
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         if dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
+
 def dt_to_iso(dt: Optional[datetime]) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if dt else ""
 
-def is_http_400(err: Exception) -> bool:
-    return isinstance(err, requests.HTTPError) and getattr(err.response, "status_code", None) == 400
 
 def quote_aaid(account_id: str) -> str:
-    # Some sites require quoting AAIDs when used in JQL user fields (esp. with `was`).
-    return f'"{account_id}"'
+    # Account IDs can contain ':'; safe for path segments
+    return requests.utils.requote_uri(account_id)
+
+
+def is_probably_html(text: str) -> bool:
+    t = (text or "").strip().lower()
+    # quick-and-dirty detection for login/proxy pages
+    return ("<html" in t) or ("<!doctype html" in t) or ("<title" in t)
+
+
+def raise_non_json_200(url: str, resp: requests.Response, verbose: bool):
+    ctype = resp.headers.get("Content-Type", "")
+    snippet = ""
+    try:
+        snippet = resp.text[:800]
+    except Exception:
+        snippet = "<non-text body>"
+    msg = [
+        f"Expected JSON but got non-JSON response (HTTP 200) from: {url}",
+        f"Content-Type: {ctype or '<none>'}",
+    ]
+    if is_probably_html(snippet):
+        msg.append("Body looks like HTML (often an SSO/proxy login page or block page).")
+    if verbose:
+        msg.append("Body snippet:\n" + snippet)
+    msg.append(
+        "Hints: ensure you are calling the correct Jira Cloud URL, your API token is valid and belongs to the same account, "
+        "and any corporate proxy/SSO is not intercepting this API path. If a proxy rewrites TLS, set CA_BUNDLE to your corp root (PEM)."
+    )
+    raise RuntimeError("\n".join(msg))
+
+
+# -----------------------
+# Jira Client
+# -----------------------
+
+PROJECT_PAGE_SIZE = 50
+
 
 class JiraClient:
-    def __init__(self, base_url: str, email: str, api_token: str):
-        self.base_url = base_url.rstrip("/")
+    def __init__(
+        self,
+        base_url: str,
+        email: str,
+        token: str,
+        verbose: bool = False,
+        ca_bundle: Optional[str] = None,
+        client_cert: Optional[str] = None,
+        client_key: Optional[str] = None,
+        insecure: bool = False,
+    ):
+        self.base_url = base_url.rstrip("/") + "/"
         self.session = requests.Session()
-        self.session.auth = HTTPBasicAuth(email, api_token)
-        self.session.headers.update({"Accept": "application/json"})
-        # caches
-        self._group_members_cache: Dict[str, Set[str]] = {}
-        self._role_map_cache: Dict[str, Dict[str, str]] = {}
-        self._role_members_cache: Dict[Tuple[str, bool], Dict[str, Set[str]]] = {}
+        self.session.auth = HTTPBasicAuth(email, token)
+        self.session.headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "export-jira-contributors/1.0"
+        })
+        # ---- TLS / cert handling ----
+        self.session.verify = False if insecure else (ca_bundle if ca_bundle else True)
+        if client_cert and client_key:
+            self.session.cert = (client_cert, client_key)
+        elif client_cert:
+            self.session.cert = client_cert
+        # ------------------------------
+        self.verbose = verbose
+        # cache for user objects
+        self._user_cache: Dict[str, Optional[dict]] = {}
 
-    def _get(self, path_or_url: str, params: Optional[Dict] = None):
-        url = path_or_url if path_or_url.startswith("http") else urljoin(self.base_url + "/", path_or_url.lstrip("/"))
-        for attempt in range(6):
-            resp = self.session.get(url, params=params, timeout=API_TIMEOUT)
-            if resp.status_code in (429,) or 500 <= resp.status_code < 600:
+    def _get(self, path: str, params: Optional[dict] = None):
+        url = urljoin(self.base_url, path.strip("/"))
+        if self.verbose:
+            print(f"[DEBUG] GET {url} params={params}")
+            if self.session.verify is True:
+                print("[DEBUG] TLS verify: system CAs")
+            elif self.session.verify is False:
+                print("[DEBUG] TLS verify: DISABLED (insecure)")
+            else:
+                print(f"[DEBUG] TLS verify: CA bundle -> {self.session.verify}")
+            if getattr(self.session, "cert", None):
+                print(f"[DEBUG] mTLS client cert configured: {self.session.cert}")
+
+        resp = self.session.get(url, params=params, allow_redirects=True)
+        if resp.status_code == 429:
+            attempt = 1
+            while resp.status_code == 429 and attempt <= 6:
+                if self.verbose:
+                    print(f"[DEBUG] 429 from {url}, backing off (attempt {attempt})")
                 backoff_sleep(resp, attempt)
-                continue
-            resp.raise_for_status()
-            if resp.text and resp.headers.get("Content-Type", "").startswith("application/json"):
-                return resp.json()
-            return None
-        raise RuntimeError(f"GET {url} failed after retries")
+                resp = self.session.get(url, params=params, allow_redirects=True)
+                attempt += 1
 
-    # ----- Projects -----
-    def iter_projects(self) -> Iterable[Dict]:
+        if self.verbose:
+            try:
+                print(f"[DEBUG] {url} -> {resp.status_code} CT={resp.headers.get('Content-Type','')}")
+            except Exception:
+                pass
+
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            if self.verbose:
+                try:
+                    print(f"[DEBUG] Body: {resp.text[:800]}")
+                except Exception:
+                    pass
+            raise
+
+        try:
+            return resp.json()
+        except ValueError:
+            raise_non_json_200(url, resp, self.verbose)
+
+    def iter_projects(self) -> Iterable[dict]:
+        """
+        Stream projects page-by-page so we can start processing immediately.
+        """
         start_at = 0
         while True:
-            data = self._get("/rest/api/3/project/search", params={"startAt": start_at, "maxResults": PROJECT_PAGE_SIZE})
-            values = (data or {}).get("values", [])
-            for proj in values:
-                yield proj
-            if not values or data.get("isLast", True):
-                break
-            start_at += data.get("maxResults", PROJECT_PAGE_SIZE)
-
-    # ----- Users with BROWSE_PROJECTS -----
-    def iter_users_with_browse(self, project_key: str, include_inactive: bool = False) -> Iterable[Dict]:
-        start_at = 0
-        page_size = 1000
-        while start_at < 1000:
-            users = self._get(
-                "/rest/api/3/user/permission/search",
-                params={
-                    "projectKey": project_key,
-                    "permissions": "BROWSE_PROJECTS",
-                    "startAt": start_at,
-                    "maxResults": page_size,
-                },
+            data = self._get(
+                "/rest/api/3/project/search",
+                params={"startAt": start_at, "maxResults": PROJECT_PAGE_SIZE},
             )
-            if not users:
+            values = data.get("values") or []
+            if not values:
                 break
-            count = 0
-            for u in users:
-                count += 1
-                if (u.get("accountType") or "").lower() == "app":
-                    continue
-                if include_inactive or u.get("active", True):
-                    yield u
-            if count < page_size:
+            for p in values:
+                yield p
+            if len(values) < PROJECT_PAGE_SIZE:
                 break
-            start_at += page_size
+            start_at += PROJECT_PAGE_SIZE
 
-    # ----- Search issues -----
-    def search_issues(self, jql: str, start_at: int = 0, max_results: int = DEFAULT_PAGE_SIZE,
-                      fields: Optional[Iterable[str]] = None, expand: Optional[Iterable[str]] = None) -> Dict:
-        params = {"jql": jql, "startAt": start_at, "maxResults": max_results}
-        if fields is not None:
-            params["fields"] = ",".join(fields)
-        if expand is not None:
-            params["expand"] = ",".join(expand)
-        return self._get("/rest/api/3/search", params=params) or {}
-
-    # ----- Roles: map + members (expand groups) -----
-    def get_project_roles_map(self, project_key: str) -> Dict[str, str]:
-        if project_key in self._role_map_cache:
-            return self._role_map_cache[project_key]
-        data = self._get(f"/rest/api/3/project/{project_key}/role") or {}
-        role_map = {name: url for name, url in data.items()}
-        self._role_map_cache[project_key] = role_map
-        return role_map
-
-    def _expand_group_members(self, group_id: Optional[str], group_name: Optional[str], include_inactive: bool) -> Set[str]:
-        cache_key = f"id:{group_id}" if group_id else f"name:{group_name}"
-        if cache_key in self._group_members_cache:
-            return self._group_members_cache[cache_key]
-
-        params = {
-            "startAt": 0,
-            "maxResults": GROUP_PAGE_SIZE,
-            "includeInactiveUsers": str(include_inactive).lower()
-        }
-        if group_id:
-            params["groupId"] = group_id
-        elif group_name:
-            params["groupname"] = group_name
-
-        members: Set[str] = set()
-        try:
-            while True:
-                data = self._get("/rest/api/3/group/member", params=params) or {}
-                vals = data.get("values", []) or []
-                for m in vals:
-                    acc = m.get("accountId")
-                    if acc:
-                        members.add(acc)
-                start_at = data.get("startAt", 0)
-                max_results = data.get("maxResults", GROUP_PAGE_SIZE)
-                total = data.get("total", start_at + len(vals))
-                if start_at + max_results >= total:
-                    break
-                params["startAt"] = start_at + max_results
-        except requests.HTTPError as e:
-            print(f"[WARN] Could not expand group members for {cache_key}: {e}", file=sys.stderr)
-
-        self._group_members_cache[cache_key] = members
-        return members
-
-    def get_project_role_members(self, project_key: str, include_inactive: bool = False) -> Dict[str, Set[str]]:
-        cache_key = (project_key, include_inactive)
-        if cache_key in self._role_members_cache:
-            return self._role_members_cache[cache_key]
-
+    def get_project_role_members(self, project_key: str) -> Dict[str, Set[str]]:
+        """
+        Return a dict: role_name -> set(accountId) for users in that project's roles.
+        """
+        roles = self._get(f"/rest/api/3/project/{project_key}/role")
         out: Dict[str, Set[str]] = {}
-        role_map = self.get_project_roles_map(project_key)
-        for role_name, role_url in role_map.items():
+        for role_name, role_url in roles.items():
             try:
-                role = self._get(role_url) or {}
+                r = self.session.get(role_url, allow_redirects=True)
+                if r.status_code == 429:
+                    attempt = 1
+                    while r.status_code == 429 and attempt <= 6:
+                        backoff_sleep(r, attempt)
+                        r = self.session.get(role_url, allow_redirects=True)
+                        attempt += 1
+                r.raise_for_status()
+                try:
+                    payload = r.json()
+                except ValueError:
+                    raise_non_json_200(role_url, r, self.verbose)
+                actors = payload.get("actors") or []
+                ids: Set[str] = set()
+                for m in actors:
+                    if m.get("type") == "atlassian-user-role-actor":
+                        if m.get("actorUser") and m["actorUser"].get("accountId"):
+                            ids.add(m["actorUser"]["accountId"])
+                out[role_name] = ids
             except requests.HTTPError as e:
-                print(f"[WARN] Failed to fetch role '{role_name}' for {project_key}: {e}", file=sys.stderr)
+                print(f"[WARN] Failed to load role {role_name} in {project_key}: {e}")
                 continue
-
-            members: Set[str] = set()
-            for actor in role.get("actors", []) or []:
-                atype = actor.get("type")
-                if atype == "atlassian-user-role-actor":
-                    acc = (actor.get("actorUser") or {}).get("accountId")
-                    if acc:
-                        members.add(acc)
-                elif atype == "atlassian-group-role-actor":
-                    grp = actor.get("actorGroup") or {}
-                    gid = grp.get("groupId")
-                    gname = grp.get("name") or actor.get("name")
-                    members |= self._expand_group_members(gid, gname, include_inactive)
-            out[role_name] = members
-
-        self._role_members_cache[cache_key] = out
         return out
 
-class AtlassianAdminClient:
-    """
-    Organization Admin API for last-active dates (per product).
-    Requires an org-level API key and the correct org ID.
-    """
-    def __init__(self, org_id: Optional[str], api_key: Optional[str]):
-        self.org_id = (org_id or "").strip()
-        self.enabled = bool(self.org_id and api_key)
-        self.base_url = "https://api.atlassian.com/admin/v1"
-        self.session = requests.Session()
-        if api_key:
-            self.session.headers.update({
-                "Authorization": f"Bearer {api_key}",
-                "Accept": "application/json",
-            })
-        self._cache: Dict[str, Optional[datetime]] = {}
+    def get_user(self, account_id: str) -> Optional[dict]:
+        """
+        Fetch and cache a Jira user by accountId.
+        Returns None if user cannot be loaded.
+        """
+        if account_id in self._user_cache:
+            return self._user_cache[account_id]
 
-    def _get(self, path: str, params: Optional[Dict] = None):
-        url = self.base_url + path
-        for attempt in range(6):
-            resp = self.session.get(url, params=params, timeout=API_TIMEOUT)
-            if resp.status_code in (429,) or 500 <= resp.status_code < 600:
-                backoff_sleep(resp, attempt)
-                continue
-            resp.raise_for_status()
-            if resp.text and resp.headers.get("Content-Type", "").startswith("application/json"):
-                return resp.json()
+        try:
+            user = self._get("/rest/api/3/user", params={"accountId": account_id})
+        except requests.HTTPError as e:
+            if self.verbose:
+                print(f"[WARN] Failed to fetch user {account_id}: {e}")
+            self._user_cache[account_id] = None
             return None
-        raise RuntimeError(f"GET {url} failed after retries")
+
+        self._user_cache[account_id] = user
+        return user
+
+
+# -----------------------
+# Atlassian Admin API client (kept for future use)
+# -----------------------
+
+class AtlassianAdminClient:
+    def __init__(
+        self,
+        org_id: Optional[str],
+        api_key: Optional[str],
+        verbose: bool = False,
+        ca_bundle: Optional[str] = None,
+        client_cert: Optional[str] = None,
+        client_key: Optional[str] = None,
+        insecure: bool = False,
+    ):
+        self.org_id = org_id
+        self.api_key = api_key
+        self.enabled = bool(org_id and api_key)
+        self.verbose = verbose
+        self.session = requests.Session()
+        self._cache: Dict[str, Optional[datetime]] = {}
+        self.session.verify = False if insecure else (ca_bundle if ca_bundle else True)
+        if client_cert and client_key:
+            self.session.cert = (client_cert, client_key)
+        elif client_cert:
+            self.session.cert = client_cert
+        if self.enabled:
+            self.session.headers.update({
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "User-Agent": "export-jira-contributors/1.0"
+            })
 
     def get_last_active_any_product(self, account_id: str) -> Optional[datetime]:
+        # Not used in current CSVs but left here if you want to add a column later.
         if not self.enabled:
             return None
         if account_id in self._cache:
             return self._cache[account_id]
+
+        url = f"https://api.atlassian.com/admin/v1/orgs/{self.org_id}/directory/users/{quote_aaid(account_id)}/last-active-dates"
+        if self.verbose:
+            print(f"[DEBUG] GET {url} (Admin API)")
+        r = self.session.get(url, allow_redirects=True)
+        if r.status_code == 429:
+            attempt = 1
+            while r.status_code == 429 and attempt <= 6:
+                if self.verbose:
+                    print(f"[DEBUG] Admin API 429, backoff (attempt {attempt})")
+                backoff_sleep(r, attempt)
+                r = self.session.get(url, allow_redirects=True)
+                attempt += 1
+        if self.verbose:
+            try:
+                print(f"[DEBUG] Admin API -> {r.status_code} CT={r.headers.get('Content-Type','')}")
+            except Exception:
+                pass
         try:
-            data = self._get(f"/orgs/{self.org_id}/directory/users/{account_id}/last-active-dates") or {}
+            r.raise_for_status()
         except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status == 403:
-                print(
-                    f"[WARN] last-active lookup failed for {account_id}: 403 Forbidden. "
-                    f"Check that the API key belongs to an Org Admin, org ID is correct, "
-                    f"and the user is a managed account in that org.", file=sys.stderr
-                )
-            else:
-                print(f"[WARN] last-active lookup failed for {account_id}: {e}", file=sys.stderr)
+            print(f"[WARN] Admin API failed for {account_id}: {e}")
             self._cache[account_id] = None
             return None
 
-        product_access = ((data.get("data") or {}).get("product_access")) or []
-        best = None
-        for pa in product_access:
-            ts = pa.get("last_active_timestamp") or pa.get("last_active")
-            dt = parse_jira_time(ts)
-            if dt and (best is None or dt > best):
-                best = dt
-        self._cache[account_id] = best
-        return best
+        try:
+            data = r.json() or {}
+        except ValueError:
+            try:
+                raise_non_json_200(url, r, self.verbose)
+            except RuntimeError as ex:
+                print(f"[WARN] {ex}")
+                self._cache[account_id] = None
+                return None
 
-def str2bool(v: Optional[str], default: bool = False) -> bool:
-    if v is None:
-        return default
-    return str(v).strip().lower() in {"1","true","t","yes","y","on"}
+        last_dt: Optional[datetime] = None
+        try:
+            if isinstance(data, dict):
+                for _, v in data.items():
+                    if isinstance(v, str):
+                        dt = parse_jira_time(v)
+                        last_dt = max(last_dt, dt) if (last_dt and dt) else (dt or last_dt)
+                    elif isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, str):
+                                dt = parse_jira_time(item)
+                                last_dt = max(last_dt, dt) if (last_dt and dt) else (dt or last_dt)
+                    elif isinstance(v, dict):
+                        for vv in v.values():
+                            if isinstance(vv, str):
+                                dt = parse_jira_time(vv)
+                                last_dt = max(last_dt, dt) if (last_dt and dt) else (dt or last_dt)
+            elif isinstance(data, list):
+                for v in data:
+                    if isinstance(v, str):
+                        dt = parse_jira_time(v)
+                        last_dt = max(last_dt, dt) if (last_dt and dt) else (dt or last_dt)
+        except Exception:
+            pass
 
-def get_latest_user_activity_in_project(jc: JiraClient, project_key: str, account_id: str,
-                                        max_issue_scan: int = 500) -> Optional[datetime]:
+        self._cache[account_id] = last_dt
+        return last_dt
+
+
+# -----------------------
+# Resume helpers
+# -----------------------
+
+def load_processed_keys(out_csv: str) -> Set[Tuple[str, str]]:
     """
-    Returns the latest UTC timestamp where the user either created an issue in the project
-    or authored an update on an issue they were ever assignee/reporter on.
-    If a 400 occurs in any JQL call, we log a WARN and SKIP this user (return None).
+    Returns processed_set of (project_key, account_id) tuples already in the projects CSV.
     """
-    aaid = quote_aaid(account_id)
+    processed: Set[Tuple[str, str]] = set()
+    if not os.path.exists(out_csv) or os.path.getsize(out_csv) == 0:
+        return processed
 
-    # 1) newest issue CREATED by the user
-    created_dt = None
-    try:
-        jql_created = f'project = "{project_key}" AND creator = {aaid} ORDER BY created DESC'
-        data_created = jc.search_issues(jql_created, start_at=0, max_results=1, fields=["created"])
-        issues_c = data_created.get("issues", [])
-        if issues_c:
-            created_dt = parse_jira_time(((issues_c[0] or {}).get("fields") or {}).get("created"))
-    except requests.HTTPError as e:
-        if is_http_400(e):
-            print(f"[WARN] 400 on created-scan; skipping user {account_id} in {project_key}", file=sys.stderr)
-            return None
-        raise
+    with open(out_csv, "r", newline="", encoding="utf-8") as rf:
+        reader = csv.reader(rf)
+        header = next(reader, None) or []
+        lower = [h.lower() for h in header]
+        try:
+            pkey_i = lower.index("project key")
+            acc_i = lower.index("account id")
+        except ValueError:
+            return processed
 
-    # 2) latest UPDATE authored by the user on issues they were ever assignee/reporter
-    jql_updated = (
-        f'project = "{project_key}" '
-        f'AND (assignee was {aaid} OR reporter was {aaid}) '
-        f'ORDER BY updated DESC'
-    )
+        for row in reader:
+            if len(row) > max(pkey_i, acc_i):
+                processed.add((row[pkey_i], row[acc_i]))
+    return processed
 
-    scanned = 0
+
+def load_user_last_work(users_csv: str) -> Dict[str, Tuple[str, Optional[datetime]]]:
+    """
+    Load existing per-user 'last worked' data from the users CSV (if present),
+    so we can merge with new data when using --resume.
+    Returns: { account_id: (user_name, last_worked_dt) }
+    """
+    data: Dict[str, Tuple[str, Optional[datetime]]] = {}
+    if not os.path.exists(users_csv) or os.path.getsize(users_csv) == 0:
+        return data
+
+    with open(users_csv, "r", newline="", encoding="utf-8") as rf:
+        reader = csv.reader(rf)
+        header = next(reader, None) or []
+        lower = [h.lower() for h in header]
+
+        try:
+            acc_i = lower.index("account id")
+            uname_i = lower.index("user name")
+        except ValueError:
+            return data
+
+        last_idx = None
+        for i, h in enumerate(lower):
+            if "last worked" in h:
+                last_idx = i
+                break
+
+        for row in reader:
+            if len(row) <= max(acc_i, uname_i):
+                continue
+            acc_id = row[acc_i]
+            uname = row[uname_i]
+            last_dt: Optional[datetime] = None
+            if last_idx is not None and len(row) > last_idx:
+                last_dt = parse_jira_time(row[last_idx])
+            if acc_id in data:
+                existing_name, existing_dt = data[acc_id]
+                if last_dt and (existing_dt is None or last_dt > existing_dt):
+                    data[acc_id] = (uname or existing_name, last_dt)
+            else:
+                data[acc_id] = (uname, last_dt)
+    return data
+
+
+# -----------------------
+# Activity
+# -----------------------
+
+def get_latest_user_activity_in_project(
+    jc: JiraClient,
+    project_key: str,
+    account_id: str,
+    max_issue_scan: int = 500,
+    verbose: bool = False,
+) -> Optional[datetime]:
+    """
+    Get the latest activity for a user in a project by scanning issues via /search
+    with expand=changelog – avoids separate per-issue calls.
+    """
+    jql = f"project={project_key} AND assignee={account_id}"
     start_at = 0
-    best_dt = None
+    best_dt: Optional[datetime] = None
+    scanned = 0
 
-    try:
-        while scanned < max_issue_scan:
-            data = jc.search_issues(jql_updated, start_at=start_at, max_results=DEFAULT_PAGE_SIZE,
-                                    fields=["updated"], expand=["changelog"])
-            issues = data.get("issues", [])
-            if not issues:
+    while scanned < max_issue_scan:
+        try:
+            resp = jc._get(
+                "/rest/api/3/search/jql",
+                params={
+                    "jql": jql,
+                    "startAt": start_at,
+                    "maxResults": 50,
+                    "expand": "changelog",
+                },
+            )
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 400:
                 break
-            for issue in issues:
-                scanned += 1
-                histories = (((issue or {}).get("changelog") or {}).get("histories")) or []
-                latest_by_user = None
-                for h in histories:
-                    if (h.get("author") or {}).get("accountId") == account_id:
-                        dt = parse_jira_time(h.get("created"))
-                        if dt and (latest_by_user is None or dt > latest_by_user):
-                            latest_by_user = dt
-                if latest_by_user and (best_dt is None or latest_by_user > best_dt):
-                    best_dt = latest_by_user
-            if len(issues) < DEFAULT_PAGE_SIZE:
-                break
-            start_at += DEFAULT_PAGE_SIZE
-    except requests.HTTPError as e:
-        if is_http_400(e):
-            print(f"[WARN] 400 on update-scan; skipping user {account_id} in {project_key}", file=sys.stderr)
-            return None
-        raise
+            raise
 
-    # 3) pick later of created vs updated
-    if created_dt and (not best_dt or created_dt >= best_dt):
-        return created_dt
+        issues = resp.get("issues") or []
+        if not issues:
+            break
+
+        for issue in issues:
+            scanned += 1
+            fields = issue.get("fields") or {}
+            updated = parse_jira_time(fields.get("updated"))
+            latest = updated
+
+            ch = issue.get("changelog") or {}
+            for h in ch.get("histories") or []:
+                created_dt = parse_jira_time(h.get("created"))
+                if created_dt and (latest is None or created_dt > latest):
+                    latest = created_dt
+
+            if latest and (best_dt is None or latest > best_dt):
+                best_dt = latest
+
+            if scanned >= max_issue_scan:
+                break
+
+        if len(issues) < 50:
+            break
+
+        start_at += 50
+
+    if verbose:
+        print(f"[DEBUG] User {account_id} in {project_key} latest: {best_dt}")
     return best_dt
 
-def export_contributors(base_url: str, email: str, token: str, out_csv: str,
-                        include_inactive: bool = False, try_email_lookup: bool = False,
-                        max_issue_scan: int = 500, show_progress: bool = True,
-                        org_id: Optional[str] = None, admin_api_key: Optional[str] = None):
-    jc = JiraClient(base_url, email, token)
-    admin = AtlassianAdminClient(org_id, admin_api_key)
 
-    if not admin.enabled:
-        print("[WARN] Org admin API is not configured; 'last active (UTC)' will be blank. "
-              "Set ATLASSIAN_ORG_ID and ATLASSIAN_API_KEY in .env", file=sys.stderr)
+# -----------------------
+# Worker task (runs in threads)
+# -----------------------
 
-    projects = list(jc.iter_projects())
-    proj_iter = tqdm(projects, desc="Projects", unit="proj") if show_progress and tqdm else projects
+def worker_task(
+    config: dict,
+    project_key: str,
+    project_name: str,
+    acc_id: str,
+    roles_str: str,
+) -> Optional[Tuple[str, str, str, str, str, str, Optional[datetime]]]:
+    """
+    Worker: create its own JiraClient, fetch user, compute last_worked_dt.
+    Returns: (pname, pkey, acc_id, user_name, email, roles_str, last_worked_dt) or None (skip).
+    """
+    jc = JiraClient(
+        config["base_url"],
+        config["email"],
+        config["token"],
+        verbose=config["verbose"],
+        ca_bundle=config["ca_bundle"],
+        client_cert=config["client_cert"],
+        client_key=config["client_key"],
+        insecure=config["insecure"],
+    )
 
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    user = jc.get_user(acc_id)
+    if not user:
+        return None
+
+    if not config["include_inactive"] and not user.get("active", True):
+        return None
+
+    if user.get("accountType") == "app":
+        return None
+
+    display_name = user.get("displayName") or user.get("name") or ""
+    email_address = user.get("emailAddress") or ""
+
+    last_worked_dt = get_latest_user_activity_in_project(
+        jc,
+        project_key,
+        acc_id,
+        max_issue_scan=config["max_issue_scan"],
+        verbose=config["verbose"],
+    )
+
+    return (
+        project_name,
+        project_key,
+        acc_id,
+        display_name,
+        email_address,
+        roles_str,
+        last_worked_dt,
+    )
+
+
+# -----------------------
+# Export
+# -----------------------
+
+def export_contributors(
+    base_url: str,
+    email: str,
+    token: str,
+    out_base: str,
+    include_inactive: bool = False,
+    max_issue_scan: int = 500,
+    show_progress: bool = True,
+    resume: bool = False,
+    verbose: bool = False,
+    org_id: Optional[str] = None,
+    org_api_key: Optional[str] = None,
+    ca_bundle: Optional[str] = None,
+    client_cert: Optional[str] = None,
+    client_key: Optional[str] = None,
+    insecure: bool = False,
+    workers: int = 4,
+):
+    """
+    Writes two CSV files:
+
+    1) <base>_projects.csv  (per-project membership)
+       Columns: project name, project key, account id, user name, email, roles
+
+    2) <base>_users.csv     (per-user last worked)
+       Columns: account id, user name, last worked (UTC)
+    """
+    # Derive two output paths from the base
+    root, ext = os.path.splitext(out_base)
+    if not ext:
+        ext = ".csv"
+    projects_csv = f"{root}_projects{ext}"
+    users_csv = f"{root}_users{ext}"
+
+    jc_main = JiraClient(
+        base_url,
+        email,
+        token,
+        verbose,
+        ca_bundle=ca_bundle,
+        client_cert=client_cert,
+        client_key=client_key,
+        insecure=insecure,
+    )
+    _admin = AtlassianAdminClient(
+        org_id,
+        org_api_key,
+        verbose,
+        ca_bundle=ca_bundle,
+        client_cert=client_cert,
+        client_key=client_key,
+        insecure=insecure,
+    )
+
+    projects_iter = jc_main.iter_projects()
+    if show_progress and tqdm:
+        proj_iter = tqdm(projects_iter, desc="Projects", unit="proj")
+    else:
+        proj_iter = projects_iter
+
+    append_mode = os.path.exists(projects_csv) and os.path.getsize(projects_csv) > 0
+    mode = "a" if append_mode else "w"
+
+    processed_keys: Set[Tuple[str, str]] = set()
+    if resume and append_mode:
+        processed_keys = load_processed_keys(projects_csv)
+        if verbose:
+            print(f"[INFO] Resume loaded {len(processed_keys)} existing rows")
+
+    user_last_work: Dict[str, Tuple[str, Optional[datetime]]] = {}
+    if resume:
+        user_last_work = load_user_last_work(users_csv)
+        if verbose:
+            print(f"[INFO] Loaded {len(user_last_work)} existing user last-worked records")
+
+    worker_config = {
+        "base_url": base_url,
+        "email": email,
+        "token": token,
+        "include_inactive": include_inactive,
+        "max_issue_scan": max_issue_scan,
+        "verbose": verbose,
+        "ca_bundle": ca_bundle,
+        "client_cert": client_cert,
+        "client_key": client_key,
+        "insecure": insecure,
+    }
+
+    with open(projects_csv, mode, newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        header = ["project name", "project key", "user name", "email",
-                  "last worked (UTC)", "last active (UTC)", "Roles"]
-        writer.writerow(header)
+        if not append_mode:
+            writer.writerow([
+                "project name",
+                "project key",
+                "account id",
+                "user name",
+                "email",
+                "Roles",
+            ])
 
-        for proj in proj_iter:
-            pkey = proj.get("key") or proj.get("id")
-            pname = proj.get("name") or pkey
-            if not pkey:
-                continue
+        # If workers <= 1, just run sequentially (no thread pool)
+        if workers <= 1:
+            for proj in proj_iter:
+                pkey = proj.get("key")
+                pname = proj.get("name") or pkey
+                if verbose:
+                    print(f"[INFO] Processing project {pkey} - {pname}")
 
-            # Preload project role membership (expands groups)
-            try:
-                role_members = jc.get_project_role_members(pkey, include_inactive=include_inactive)
-            except requests.HTTPError as e:
-                print(f"[WARN] Failed to load roles for {pkey}: {e}", file=sys.stderr)
-                role_members = {}
+                try:
+                    role_members = jc_main.get_project_role_members(pkey)
+                except Exception as e:
+                    print(f"[WARN] Roles failed for {pkey}: {e}")
+                    role_members = {}
 
-            users = list(jc.iter_users_with_browse(pkey, include_inactive=include_inactive))
-            user_iter = tqdm(users, desc=f"{pkey} users", leave=False, unit="user") if show_progress and tqdm else users
+                project_user_ids: Set[str] = set()
+                for _, members in role_members.items():
+                    project_user_ids.update(members)
 
-            email_cache: Dict[str, Optional[str]] = {}
+                if verbose:
+                    print(f"[INFO] {pkey} has {len(project_user_ids)} users from roles")
 
-            for user in user_iter:
-                acc_id = user.get("accountId")
-                if not acc_id:
+                if not project_user_ids:
                     continue
-                display_name = user.get("displayName") or user.get("name") or ""
-                email_address = user.get("emailAddress") or ""
-                if not email_address and try_email_lookup:
-                    if acc_id not in email_cache:
-                        try:
-                            email_cache[acc_id] = jc._get("/rest/api/3/user/email", params={"accountId": acc_id}).get("email")
-                        except Exception:
-                            email_cache[acc_id] = None
-                    email_address = email_cache.get(acc_id) or ""
 
-                last_worked_dt = get_latest_user_activity_in_project(
-                    jc, pkey, acc_id, max_issue_scan=max_issue_scan
-                )
-                # if 400 occurred, function returns None; we still write the row
+                for acc_id in sorted(project_user_ids):
 
-                last_active_dt = admin.get_last_active_any_product(acc_id)
+                    resume_key = (pkey, acc_id)
+                    if resume and resume_key in processed_keys:
+                        if verbose:
+                            print(f"[SKIP] {pkey}-{acc_id} (resume)")
+                        continue
 
-                user_roles = sorted([rname for rname, members in (role_members or {}).items() if acc_id in members])
-                roles_str = "; ".join(user_roles)
+                    result = worker_task(
+                        worker_config,
+                        project_key=pkey,
+                        project_name=pname,
+                        acc_id=acc_id,
+                        roles_str="; ".join(
+                            r for r, members in role_members.items() if acc_id in members
+                        ),
+                    )
+                    if result is None:
+                        if resume:
+                            processed_keys.add(resume_key)
+                        continue
 
-                writer.writerow([
-                    pname, pkey, display_name, email_address,
-                    dt_to_iso(last_worked_dt), dt_to_iso(last_active_dt), roles_str
-                ])
+                    pname2, pkey2, acc_id2, display_name, email_address, roles_str, last_worked_dt = result
+
+                    # update per-user aggregated last-worked
+                    if acc_id2 in user_last_work:
+                        existing_name, existing_dt = user_last_work[acc_id2]
+                        best_name = display_name or existing_name
+                        if last_worked_dt and (existing_dt is None or last_worked_dt > existing_dt):
+                            user_last_work[acc_id2] = (best_name, last_worked_dt)
+                        else:
+                            user_last_work[acc_id2] = (best_name, existing_dt)
+                    else:
+                        user_last_work[acc_id2] = (display_name, last_worked_dt)
+
+                    row = [
+                        pname2,
+                        pkey2,
+                        acc_id2,
+                        display_name,
+                        email_address,
+                        roles_str,
+                    ]
+                    writer.writerow(row)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except Exception:
+                        pass
+
+                    if verbose:
+                        print(f"[WRITE] {pkey2}-{display_name} ({acc_id2})")
+
+                    if resume:
+                        processed_keys.add(resume_key)
+
+        else:
+            # Parallel mode with ThreadPoolExecutor
+            from concurrent.futures import Future
+
+            pending: Set[Future] = set()
+            future_to_resume: Dict[Future, Tuple[str, str]] = {}
+
+            def drain_completed(all_done: bool = False):
+                """Write completed futures' results to CSV and update aggregates."""
+                nonlocal pending
+                done_list = list(pending) if all_done else [ft for ft in list(pending) if ft.done()]
+                for ft in done_list:
+                    pending.remove(ft)
+                    resume_key = future_to_resume.pop(ft, None)
+                    result = ft.result()
+                    if result is None:
+                        if resume and resume_key:
+                            processed_keys.add(resume_key)
+                        continue
+
+                    pname2, pkey2, acc_id2, display_name, email_address, roles_str, last_worked_dt = result
+
+                    # update per-user aggregated last-worked
+                    if acc_id2 in user_last_work:
+                        existing_name, existing_dt = user_last_work[acc_id2]
+                        best_name = display_name or existing_name
+                        if last_worked_dt and (existing_dt is None or last_worked_dt > existing_dt):
+                            user_last_work[acc_id2] = (best_name, last_worked_dt)
+                        else:
+                            user_last_work[acc_id2] = (best_name, existing_dt)
+                    else:
+                        user_last_work[acc_id2] = (display_name, last_worked_dt)
+
+                    row = [
+                        pname2,
+                        pkey2,
+                        acc_id2,
+                        display_name,
+                        email_address,
+                        roles_str,
+                    ]
+                    writer.writerow(row)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except Exception:
+                        pass
+
+                    if verbose:
+                        print(f"[WRITE] {pkey2}-{display_name} ({acc_id2})")
+
+                    if resume and resume_key:
+                        processed_keys.add(resume_key)
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for proj in proj_iter:
+                    pkey = proj.get("key")
+                    pname = proj.get("name") or pkey
+                    if verbose:
+                        print(f"[INFO] Processing project {pkey} - {pname}")
+
+                    try:
+                        role_members = jc_main.get_project_role_members(pkey)
+                    except Exception as e:
+                        print(f"[WARN] Roles failed for {pkey}: {e}")
+                        role_members = {}
+
+                    project_user_ids: Set[str] = set()
+                    for _, members in role_members.items():
+                        project_user_ids.update(members)
+
+                    if verbose:
+                        print(f"[INFO] {pkey} has {len(project_user_ids)} users from roles")
+
+                    if not project_user_ids:
+                        continue
+
+                    for acc_id in sorted(project_user_ids):
+                        resume_key = (pkey, acc_id)
+                        if resume and resume_key in processed_keys:
+                            if verbose:
+                                print(f"[SKIP] {pkey}-{acc_id} (resume)")
+                            continue
+
+                        roles_str = "; ".join(
+                            r for r, members in role_members.items() if acc_id in members
+                        )
+
+                        ft = executor.submit(
+                            worker_task,
+                            worker_config,
+                            pkey,
+                            pname,
+                            acc_id,
+                            roles_str,
+                        )
+                        pending.add(ft)
+                        future_to_resume[ft] = resume_key
+
+                        # keep queue bounded so we start writing as tasks finish
+                        if len(pending) >= workers * 10:
+                            drain_completed(all_done=False)
+
+                # after all tasks submitted, drain the rest
+                drain_completed(all_done=True)
+
+    # After processing all projects, write / rewrite the per-user sheet
+    with open(users_csv, "w", newline="", encoding="utf-8") as uf:
+        uwriter = csv.writer(uf)
+        uwriter.writerow(["account id", "user name", "last worked (UTC)"])
+        for acc_id in sorted(user_last_work.keys()):
+            uname, last_dt = user_last_work[acc_id]
+            uwriter.writerow([acc_id, uname, dt_to_iso(last_dt)])
+
+    if verbose:
+        print(f"[INFO] Wrote per-project data to {projects_csv}")
+        print(f"[INFO] Wrote per-user last-worked data to {users_csv}")
+
+
+# -----------------------
+# CLI
+# -----------------------
 
 def main():
     load_dotenv(find_dotenv(usecwd=True))
 
-    parser = argparse.ArgumentParser(description="Export Jira Cloud contributors with latest activity, last login, and project roles (.env supported).")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Export Jira contributors (by project roles) into two CSVs: "
+            "1) per-project membership, 2) per-user last worked. "
+            "Supports resume, TLS options, and parallel workers."
+        )
+    )
     parser.add_argument("--base-url", default=os.environ.get("JIRA_BASE_URL"))
     parser.add_argument("--email", default=os.environ.get("JIRA_EMAIL"))
     parser.add_argument("--api-token", default=os.environ.get("JIRA_API_TOKEN"))
-    parser.add_argument("-o", "--out", default=os.environ.get("OUTPUT_CONTRIBUTORS", os.environ.get("OUT", "jira_contributors.csv")))
-    parser.add_argument("--include-inactive", action="store_true", default=str2bool(os.environ.get("INCLUDE_INACTIVE", "false")))
-    parser.add_argument("--try-email-lookup", action="store_true", default=str2bool(os.environ.get("TRY_EMAIL_LOOKUP", "false")))
-    parser.add_argument("--max-issue-scan", type=int, default=int(os.environ.get("MAX_ISSUE_SCAN", "500")))
-    parser.add_argument("--no-progress", action="store_true", default=str2bool(os.environ.get("NO_PROGRESS", "false")))
+    parser.add_argument(
+        "-o",
+        "--out",
+        default=os.environ.get("OUT_CONTRIBUTORS", "jira_contributors.csv"),
+        help="Base output path; will create <base>_projects.csv and <base>_users.csv",
+    )
+    parser.add_argument(
+        "--include-inactive",
+        action="store_true",
+        default=str2bool(os.environ.get("INCLUDE_INACTIVE", "false")),
+    )
+    parser.add_argument(
+        "--max-issue-scan",
+        type=int,
+        default=int(os.environ.get("MAX_ISSUE_SCAN", "500")),
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        default=str2bool(os.environ.get("NO_PROGRESS", "false")),
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=str2bool(os.environ.get("RESUME", "false")),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=str2bool(os.environ.get("VERBOSE", "false")),
+    )
     parser.add_argument("--org-id", default=os.environ.get("ATLASSIAN_ORG_ID"))
     parser.add_argument("--org-api-key", default=os.environ.get("ATLASSIAN_API_KEY"))
+
+    # TLS / certificate options (env-driven, with CLI override)
+    parser.add_argument(
+        "--ca-bundle",
+        default=os.environ.get("CA_BUNDLE"),
+        help="Path to custom CA bundle .crt/.pem (PEM) used to verify server certificates",
+    )
+    parser.add_argument(
+        "--client-cert",
+        default=os.environ.get("CLIENT_CERT"),
+        help="Path to client certificate PEM (or combined cert+key PEM) if proxy requires mTLS",
+    )
+    parser.add_argument(
+        "--client-key",
+        default=os.environ.get("CLIENT_KEY"),
+        help="Path to client private key PEM (if separate)",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        default=str2bool(os.environ.get("INSECURE", "false")),
+        help="Disable TLS verification (NOT recommended)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.environ.get("WORKERS", "4")),
+        help="Number of parallel workers for fetching user data (>=1, default 4).",
+    )
+
     args = parser.parse_args()
 
-    missing = [k for k, v in {
-        "JIRA_BASE_URL": args.base_url,
-        "JIRA_EMAIL": args.email,
-        "JIRA_API_TOKEN": args.api_token,
-    }.items() if not v]
+    missing = [
+        k
+        for k, v in {
+            "JIRA_BASE_URL": args.base_url,
+            "JIRA_EMAIL": args.email,
+            "JIRA_API_TOKEN": args.api_token,
+        }.items()
+        if not v
+    ]
     if missing:
-        print("Missing required configuration: " + ", ".join(missing), file=sys.stderr)
-        print("Tip: set them in .env or pass as CLI flags.", file=sys.stderr)
+        print("Missing required settings: " + ", ".join(missing), file=sys.stderr)
         sys.exit(2)
 
-    show_progress = (not args.no_progress)
-    if tqdm is None and show_progress:
-        print("[WARN] tqdm not installed; progress bars disabled. Install with: pip install tqdm", file=sys.stderr)
-        show_progress = False
+    show_progress = not args.no_progress
 
-    try:
-        export_contributors(args.base_url, args.email, args.api_token, args.out,
-                            include_inactive=args.include_inactive, try_email_lookup=args.try_email_lookup,
-                            max_issue_scan=args.max_issue_scan, show_progress=show_progress,
-                            org_id=args.org_id, admin_api_key=args.org_api_key)
-        print(f"Done. Wrote: {args.out}")
-    except requests.HTTPError as e:
-        print(f"HTTP error: {e} – response: {getattr(e, 'response', None) and e.response.text}", file=sys.stderr)
-        sys.exit(1)
+    export_contributors(
+        args.base_url,
+        args.email,
+        args.api_token,
+        args.out,
+        include_inactive=args.include_inactive,
+        max_issue_scan=args.max_issue_scan,
+        show_progress=show_progress,
+        resume=args.resume,
+        verbose=args.verbose,
+        org_id=args.org_id,
+        org_api_key=args.org_api_key,
+        ca_bundle=args.ca_bundle,
+        client_cert=args.client_cert,
+        client_key=args.client_key,
+        insecure=args.insecure,
+        workers=max(1, args.workers),
+    )
+
 
 if __name__ == "__main__":
     main()
